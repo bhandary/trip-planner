@@ -15,7 +15,7 @@ import os
 import re
 import uuid
 from datetime import date, timedelta
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, NamedTuple
 
 from dotenv import load_dotenv
 from langchain.agents import AgentState, create_agent
@@ -278,13 +278,13 @@ def _accepted_args(tool: BaseTool, raw: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in filled.items() if key in props}
 
 
+ASSUMED_DRIVER_AGE = "assumed driver age 30 — tell me yours if different"
+
+
 def driver_age_note(age: Any) -> str:
-    """Use a stated age. Otherwise say explicitly that 30 is an assumed age."""
+    """Use a stated age. Otherwise say that 30 was assumed."""
     if age is None or str(age).strip() == "":
-        return (
-            "No driver age was stated. Assumed age 30. "
-            "30 is an assumed age for this search. Prices may change for a different age."
-        )
+        return ASSUMED_DRIVER_AGE
     return f"Driver age {age} was taken from the request."
 
 
@@ -444,7 +444,10 @@ def attach_call_fallback(tool: BaseTool, alt_server: str) -> BaseTool:
                 tool.name, already_failed, alt_tools, fallback_args
             )
         if tool.name == "search" and alt_server == "cars_alt":
-            note = driver_age_note(kwargs.get("age") or kwargs.get("driver_age"))
+            # OctoTrip defaults age to 30. That default is not the traveler's age.
+            raw_age = kwargs.get("age", kwargs.get("driver_age"))
+            stated = None if raw_age in (None, "", 30, "30", "30+", 30.0) else raw_age
+            note = driver_age_note(stated)
             if isinstance(result, str):
                 result = f"{result}\n{note}"
             elif isinstance(result, tuple) and result:
@@ -509,7 +512,7 @@ You are not allowed to ask any more follow up questions, you must find the best 
 - Date (time of year which you believe is best, unless the task already names dates)
 When the trip implies a return (a stay, a round trip, or an end date), search the outbound flight on the trip start date and the return flight on the trip end date. Search one-way only when the traveler asked for one-way. Do not search other date ranges. A result for different dates is an alternate: label it as different dates and do not present it as the trip.
 Each Kiwi itinerary block is one result. Copy its price, legs, and booking link together. Never attach one itinerary's booking link or price to another itinerary's legs.
-If a block warns that arrival is a day or more after the trip start, or that the trip is mostly eaten by travel, repeat that warning.
+If a block warns that arrival is a day or more after the trip start, or that the trip is mostly eaten by travel, repeat that warning. Show the currency Kiwi returned (for example EUR). Do not relabel it as dollars. If a return arrives on a later calendar day, label it next-day arrival.
 You may need to make multiple searches to iteratively find the best options.
 You will be given the origin and destination. It is your job to think critically about the best options.
 If an MCP tool fails, returns malformed output, or does not give you usable flight results, try the tool again.
@@ -540,6 +543,9 @@ name, neighborhood, nightly rate and total for the stay with currency, whether
 taxes and fees are included, rating, cancellation policy if shown, two or three
 relevant amenities, and the booking link. Add one line on the tradeoff of each
 option (for example cheaper but 25 minutes from the venue).
+The hotel name is the property name in the tool result (the Skiplagged Hotel
+column). Neighborhood, Nightly rate, Cancellation, and Tradeoff are field
+labels, not hotels.
 
 Report only prices and availability that a tool returned in this conversation.
 If results are thin or a constraint could not be met, say so plainly and suggest
@@ -561,9 +567,10 @@ with web search.
 For a fly-in trip, default pickup and drop-off to the arrival airport unless the
 task names a different place. If a city search returns no_results, search that
 city's airport before giving up.
-Do not guess a driver age. If the task states an age, use that age. If it does
-not, say that 30 is an assumed age and that the price may change. Keep each
-vehicle name and its price with the offer. Vehicle class, transmission, and budget are optional; apply them
+Do not guess a driver age. If the traveler stated an age, use that age. If not,
+pass 30 to the tool and write exactly: assumed driver age 30 — tell me yours if different.
+Do not write "driver age 30+" as if the traveler said it. Keep each vehicle's
+name, price, vendor, and booking link together. Vehicle class, transmission, and budget are optional; apply them
 when given.
 
 Return 3 to 5 options, ranked by fit. For each one give: supplier, vehicle class,
@@ -1160,6 +1167,82 @@ def extract_grounded_venues(text: str) -> set[str]:
     return cleaned
 
 
+HOTEL_FIELD_LABELS = {
+    "neighborhood",
+    "neighbourhood",
+    "nightly rate",
+    "cancellation",
+    "tradeoff",
+    "trade-off",
+    "trade off",
+    "hotel",
+    "rating",
+    "price/night",
+    "price per night",
+    "total",
+    "amenities",
+    "booking",
+    "name",
+    "address",
+    "check-in",
+    "check-out",
+    "taxes",
+    "fees",
+}
+
+
+def _is_hotel_label(name: str) -> bool:
+    return name.strip().strip(":").casefold() in HOTEL_FIELD_LABELS
+
+
+def extract_skiplagged_hotels(text: str) -> list[str]:
+    """Property names from a Skiplagged markdown table, never the column headers."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"(?m)^\|\s*\*\*([^*|\n]+)\*\*", text or ""):
+        name = re.sub(r"\s+", " ", match.group(1)).strip()
+        key = name.casefold()
+        if not name or _is_hotel_label(name) or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def extract_hotel_names(text: str) -> list[str]:
+    """Hotel names from a HOTELS block or Skiplagged table. Field labels are not hotels."""
+    if not text:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        name = re.sub(r"\s+", " ", name).strip(" -*")
+        key = name.casefold()
+        if not name or _is_hotel_label(name) or key in seen:
+            return
+        if not looks_like_venue_label(name):
+            return
+        seen.add(key)
+        names.append(name)
+
+    hotels_block = re.search(r"(?m)^HOTELS:\n(.*?)(?:\n[A-Z][A-Z ]+:|\Z)", text, re.S)
+    if hotels_block:
+        for line in hotels_block.group(1).splitlines():
+            match = re.match(r"^-\s+(.+)", line.strip())
+            if match:
+                add(match.group(1).split("|")[0].strip())
+        if names:
+            return names
+    for name in extract_skiplagged_hotels(text):
+        add(name)
+    if names:
+        return names
+    for name in extract_listed_names(text):
+        add(name)
+    return names
+
+
 def extract_listed_names(text: str) -> list[str]:
     """Hotel or venue names from bold labels and list entries."""
     names: list[str] = []
@@ -1464,12 +1547,21 @@ def _walk_itineraries(node: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _itinerary_price(node: dict[str, Any]) -> tuple[str, str]:
+def _itinerary_price(node: dict[str, Any], fallback_currency: str = "") -> tuple[str, str]:
+    formatted = str(node.get("priceFormatted") or "")
     price = node.get("price", node.get("priceEur", node.get("fare")))
-    currency = str(node.get("currency") or node.get("currencyCode") or "")
+    currency = str(node.get("currency") or node.get("currencyCode") or fallback_currency or "")
     if isinstance(price, dict):
         currency = str(price.get("currency") or currency)
         price = price.get("amount") or price.get("value")
+    if not currency and formatted:
+        found = re.search(r"\b([A-Z]{3})\b", formatted)
+        if found:
+            currency = found.group(1)
+    if price in (None, "") and formatted:
+        amount = re.search(r"([0-9]+(?:\.[0-9]+)?)", formatted)
+        if amount:
+            price = amount.group(1)
     return str(price), currency
 
 
@@ -1589,19 +1681,57 @@ def travel_eaten_warning(items: list[dict[str, Any]], args: dict[str, Any]) -> s
     return " ".join(dict.fromkeys(notes))
 
 
+def _arrival_note(direction: dict[str, Any]) -> str:
+    """Label a hop whose arrival is on a later calendar day."""
+    if not isinstance(direction, dict):
+        return ""
+    depart = _parse_date(
+        direction.get("departureTime") or direction.get("local_departure") or direction.get("departure")
+    )
+    arrive = _parse_date(
+        direction.get("arrivalTime") or direction.get("local_arrival") or direction.get("arrival")
+    )
+    if depart and arrive and arrive > depart:
+        return f"next-day arrival ({arrive.day} {arrive.strftime('%b')})"
+    return ""
+
+
+def _direction_notes(item: dict[str, Any]) -> list[str]:
+    notes: list[str] = []
+    outbound = item.get("outbound")
+    inbound = item.get("inbound") if isinstance(item.get("inbound"), dict) else item.get("return")
+    if isinstance(outbound, dict):
+        note = _arrival_note(outbound)
+        if note:
+            notes.append(f"outbound: {note}")
+    if isinstance(inbound, dict):
+        note = _arrival_note(inbound)
+        if note:
+            notes.append(f"return: {note}")
+    if notes:
+        return notes
+    for leg in _itinerary_legs(item):
+        note = _arrival_note(leg)
+        if note:
+            return [note]
+    return []
+
+
 def render_kiwi_itineraries(payload: Any, args: dict[str, Any] | None = None) -> str:
     """One block per Kiwi result so price, legs, and booking link stay together."""
     args = args or {}
     items = _walk_itineraries(payload)
     if not items:
         return payload if isinstance(payload, str) else json.dumps(payload, default=str)
+    envelope_currency = str(payload.get("currency") or "") if isinstance(payload, dict) else ""
     blocks: list[str] = []
     for index, item in enumerate(items, 1):
-        price, currency = _itinerary_price(item)
+        price, currency = _itinerary_price(item, envelope_currency)
         link = _itinerary_link(item)
         legs = "\n".join(f"  - {_leg_line(leg)}" for leg in _itinerary_legs(item)) or "  - (no legs)"
         outbound_date, return_date = _itinerary_search_dates(item, args)
         warning = travel_eaten_warning([item], args)
+        arrival_notes = _direction_notes(item)
         blocks.append(
             f"ITINERARY {index}\n"
             f"price: {price} {currency}".rstrip()
@@ -1610,6 +1740,7 @@ def render_kiwi_itineraries(payload: Any, args: dict[str, Any] | None = None) ->
             + f"outbound_date: {outbound_date.isoformat() if outbound_date else 'unspecified'}\n"
             + f"return_date: {return_date.isoformat() if return_date else 'unspecified'}\n"
             + f"legs:\n{legs}\n"
+            + (("\n".join(arrival_notes) + "\n") if arrival_notes else "")
             + "These price, legs, and booking_link values are one Kiwi result. "
             + "Do not combine them with another itinerary."
             + (f"\nWARNING: {warning}" if warning else "")
@@ -1776,13 +1907,49 @@ def _tool_blob(messages: list[Any], name: str) -> str:
     return "\n".join(parts)
 
 
-def _walk_car_offers(node: Any, found: list[tuple[str, str]]) -> None:
+class CarOffer(NamedTuple):
+    name: str
+    price: str
+    vendor: str
+    link: str
+
+
+def _car_offer_from_node(node: dict[str, Any]) -> CarOffer | None:
+    """One OctoTrip or Upfront offer. Ignore envelopes and field objects."""
+    name = node.get("name") or node.get("vehicle") or node.get("car") or node.get("model")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    price = node.get("price")
+    if price in (None, "", []) or isinstance(price, (dict, list)):
+        price = node.get("total_price") or node.get("totalPrice")
+    if price in (None, "", []) or isinstance(price, (dict, list)):
+        return None
+    vendor = str(node.get("vendor") or node.get("supplier") or node.get("company") or "").strip()
+    link = str(
+        node.get("booking_url")
+        or node.get("bookingUrl")
+        or node.get("deep_link")
+        or node.get("url")
+        or ""
+    ).strip()
+    if not any(
+        key in node
+        for key in ("vehicle", "vendor", "supplier", "booking_url", "bookingUrl", "category", "sipp", "car")
+    ):
+        return None
+    currency = str(node.get("currency") or "").strip()
+    if isinstance(price, float):
+        amount = f"{price:.2f}"
+    else:
+        amount = str(price)
+    return CarOffer(name.strip(), f"{amount} {currency}".strip(), vendor, link)
+
+
+def _walk_car_offers(node: Any, found: list[CarOffer]) -> None:
     if isinstance(node, dict):
-        name = node.get("name") or node.get("vehicle")
-        price = node.get("price")
-        if isinstance(name, str) and price not in (None, "", []) and not isinstance(price, (dict, list)):
-            currency = str(node.get("currency") or "").strip()
-            found.append((name.strip(), f"{price} {currency}".strip()))
+        offer = _car_offer_from_node(node)
+        if offer is not None:
+            found.append(offer)
         for value in node.values():
             _walk_car_offers(value, found)
     elif isinstance(node, list):
@@ -1790,55 +1957,112 @@ def _walk_car_offers(node: Any, found: list[tuple[str, str]]) -> None:
             _walk_car_offers(item, found)
 
 
-def extract_car_offers(text: str) -> list[tuple[str, str]]:
-    """Vehicle name and price from an OctoTrip or Upfront payload or a CARS block."""
-    found: list[tuple[str, str]] = []
-    candidates = [text]
-    if text and len(text) <= 20000:
-        candidates.extend(re.findall(r"(\{.*\}|\[.*\])", text, re.S)[:3])
-    for candidate in candidates:
+def _json_values(text: str) -> list[Any]:
+    """Decode every JSON value in text, including payloads larger than one regex match."""
+    if not text:
+        return []
+    values: list[Any] = []
+    stripped = text.strip()
+    try:
+        values.append(json.loads(stripped))
+        return values
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        start = text.find("{", index)
+        bracket = text.find("[", index)
+        if start < 0 and bracket < 0:
+            break
+        if start < 0 or (bracket >= 0 and bracket < start):
+            start = bracket
         try:
-            _walk_car_offers(json.loads(candidate), found)
+            value, end = decoder.raw_decode(text, start)
         except json.JSONDecodeError:
+            index = start + 1
             continue
+        values.append(value)
+        index = max(end, start + 1)
+    return values
+
+
+def _car_line(offer: CarOffer) -> str:
+    parts = [offer.name, offer.price]
+    if offer.vendor:
+        parts.append(offer.vendor)
+    if offer.link:
+        parts.append(offer.link)
+    return "- " + " | ".join(parts)
+
+
+def extract_car_offers(text: str) -> list[CarOffer]:
+    """Vehicle, price, vendor, and link from an OctoTrip payload or a CARS block."""
+    found: list[CarOffer] = []
+    for value in _json_values(text or ""):
+        _walk_car_offers(value, found)
     for line in (text or "").splitlines():
-        match = re.match(r"^-\s+(.+?)\s+\|\s+(.+)$", line.strip())
-        if match:
-            found.append((match.group(1).strip(), match.group(2).strip()))
-    unique: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for item in found:
-        if item not in seen:
-            seen.add(item)
-            unique.append(item)
+        stripped = line.strip()
+        if not stripped.startswith("- "):
+            continue
+        parts = [part.strip() for part in stripped[2:].split("|")]
+        if len(parts) >= 4:
+            found.append(CarOffer(parts[0], parts[1], parts[2], parts[3]))
+        elif len(parts) == 3:
+            found.append(CarOffer(parts[0], parts[1], parts[2], ""))
+        elif len(parts) == 2:
+            found.append(CarOffer(parts[0], parts[1], "", ""))
+    unique: list[CarOffer] = []
+    seen: set[tuple[str, str, str]] = set()
+    for offer in found:
+        key = (offer.name.casefold(), offer.price, offer.link)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(offer)
     return unique
+
+
+def offers_to_keep(car_text: str) -> list[CarOffer]:
+    """Offers the specialist named. If it named none, the first few structured offers."""
+    offers = extract_car_offers(car_text)
+    if not offers:
+        return []
+    prose = car_text.split("CARS:")[0]
+    presented = [offer for offer in offers if offer.name.casefold() in prose.casefold()]
+    if presented:
+        return presented
+    return offers[:4]
 
 
 def render_car_block(text: str) -> str:
     offers = extract_car_offers(text)
     if not offers:
         return ""
-    lines = "\n".join(f"- {name} | {price}" for name, price in offers)
+    lines = "\n".join(_car_line(offer) for offer in offers)
     return f"CARS:\n{lines}"
 
 
 def ensure_cars_kept(answer: str, car_text: str) -> str:
-    """Keep vehicle names and prices, and an explicit assumed age when none was stated."""
+    """Keep name, price, vendor, and link for the cars the specialist presented."""
     if not car_text.strip():
         return answer
     missing: list[str] = []
-    for name, price in extract_car_offers(car_text):
-        amount = price.split()[0]
-        if name.casefold() not in answer.casefold() or amount not in answer:
-            missing.append(f"- {name} | {price}")
+    for offer in offers_to_keep(car_text):
+        folded = answer.casefold()
+        amount = offer.price.split()[0]
+        present = offer.name.casefold() in folded and amount in answer
+        if offer.vendor and offer.vendor.casefold() not in folded:
+            present = False
+        if offer.link and offer.link not in answer:
+            present = False
+        if not present:
+            missing.append(_car_line(offer))
     extra = ""
     if missing:
         extra += "\n\nRental cars returned by the specialist (kept):\n" + "\n".join(missing)
-    if re.search(r"assumed age", car_text, re.I) and not re.search(r"assumed age", answer, re.I):
-        extra += (
-            "\n\nNo driver age was stated. Assumed age 30. "
-            "30 is an assumed age. Prices may change for a different age."
-        )
+    if ASSUMED_DRIVER_AGE in car_text and ASSUMED_DRIVER_AGE not in answer:
+        extra += "\n\n" + ASSUMED_DRIVER_AGE
     if not extra:
         return answer
     return answer.rstrip() + extra
@@ -1868,26 +2092,118 @@ def separate_alternate_flights(answer: str, flight_text: str) -> str:
     return text
 
 
+def _itinerary_blocks(text: str) -> list[str]:
+    return [
+        chunk.strip()
+        for chunk in re.split(r"\n(?=ITINERARY \d+)", text or "")
+        if chunk.strip().startswith("ITINERARY")
+    ]
+
+
+def _block_value(block: str, field: str) -> str:
+    match = re.search(rf"(?m)^{field}:\s*(\S+)", block)
+    return match.group(1) if match else ""
+
+
 def ensure_flight_legs(answer: str, flight_text: str) -> str:
-    """Keep each matching itinerary's timed legs when the summary drops them."""
+    """Keep legs for the itineraries the plan presents, or the top 3."""
     if "legs:" not in (flight_text or ""):
         return answer
     primary = flight_text.split("ALTERNATE DATES")[0]
-    times = re.findall(r"depart (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)", primary)
-    if not times or any(stamp in answer for stamp in times):
-        return answer
-    blocks = [
-        chunk.strip()
-        for chunk in re.split(r"\n(?=ITINERARY \d+)", primary)
-        if chunk.strip().startswith("ITINERARY")
-    ]
+    blocks = _itinerary_blocks(primary)
     if not blocks:
+        return answer
+    presented = [
+        block for block in blocks if (link := _block_value(block, "booking_link")) and link in answer
+    ]
+    if not presented:
+        presented = [
+            block
+            for block in blocks
+            if (price := _block_value(block, "price")) and price in answer
+        ]
+    chosen = presented or blocks[:3]
+    missing: list[str] = []
+    for block in chosen:
+        stamps = re.findall(r"depart (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)", block)
+        if stamps and all(stamp in answer for stamp in stamps):
+            continue
+        missing.append(block)
+    if not missing:
         return answer
     return (
         answer.rstrip()
         + "\n\nFlight legs for the requested dates:\n\n"
-        + "\n\n".join(blocks)
+        + "\n\n".join(missing)
     )
+
+
+def lock_flight_currency(answer: str, flight_text: str) -> str:
+    """Keep the currency Kiwi returned. Do not leave a euro fare labeled as dollars."""
+    if not answer or not flight_text:
+        return answer
+    for match in re.finditer(
+        r"(?m)^price:\s*([0-9]+(?:\.[0-9]+)?)(?:\s*([A-Za-z]{3}|€))?",
+        flight_text,
+    ):
+        amount, currency = match.group(1), (match.group(2) or "").upper()
+        if currency not in {"EUR", "€"}:
+            continue
+        forms = {amount}
+        if amount.endswith(".0"):
+            forms.add(amount[:-2])
+        for form in forms:
+            answer = re.sub(rf"\${re.escape(form)}\b", f"{form} EUR", answer)
+            answer = re.sub(
+                rf"\b{re.escape(form)}\s*(?:USD|US\$)\b",
+                f"{form} EUR",
+                answer,
+                flags=re.I,
+            )
+    return answer
+
+
+_INVENTED_DRIVER_AGE = re.compile(
+    r"\b(?:driver(?:'s)?\s+age|drivers?\s+aged|age)\s*30\s*\+?\.?",
+    re.I,
+)
+
+
+def _human_text(messages: list[Any]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        if getattr(message, "type", None) == "human" or isinstance(message, HumanMessage):
+            parts.append(_message_text(message.content))
+    return "\n".join(parts)
+
+
+def enforce_assumed_driver_age(answer: str, messages: list[Any], car_text: str) -> str:
+    """A tool default of 30 is an assumption. Do not present it as the traveler's age."""
+    answer = re.sub(
+        r"assumed driver age 30\s*[—–-]\s*tell me yours if different",
+        ASSUMED_DRIVER_AGE,
+        answer or "",
+        flags=re.I,
+    )
+    stated = stated_driver_age(_human_text(messages))
+    if stated:
+        if ASSUMED_DRIVER_AGE in answer:
+            return answer.replace(
+                ASSUMED_DRIVER_AGE,
+                f"Driver age {stated} was taken from the request.",
+            )
+        return answer
+    mentions_cars = bool(car_text.strip()) or bool(
+        re.search(r"\brental\b|\bdriver age\b", answer or "", re.I)
+    )
+    if not mentions_cars and ASSUMED_DRIVER_AGE not in (answer or ""):
+        return answer
+    chunks = (answer or "").split(ASSUMED_DRIVER_AGE)
+    scrubbed = [_INVENTED_DRIVER_AGE.sub("", chunk) for chunk in chunks]
+    body = "\n\n".join(re.sub(r"\n{3,}", "\n\n", chunk).strip() for chunk in scrubbed if chunk.strip())
+    if ASSUMED_DRIVER_AGE in body:
+        return body
+    return (body.rstrip() + "\n\n" + ASSUMED_DRIVER_AGE).strip()
 
 
 def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
@@ -1908,7 +2224,7 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
             if not parsed:
                 explicit_none = True
             allowed |= parsed
-    hotel_names = extract_listed_names(hotels)
+    hotel_names = extract_hotel_names(hotels)
     before = answer
     if dining_called:
         answer = drop_ungrounded_claims(answer, allowed, hotel_names)
@@ -1919,9 +2235,11 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
             answer = answer.rstrip() + "\n\n" + VENUE_UNAVAILABLE
     answer = ensure_hotels_kept(answer, hotel_names)
     answer = ensure_cars_kept(answer, cars)
+    answer = enforce_assumed_driver_age(answer, messages, cars)
     answer = repair_flight_pairing(answer, flights)
     answer = separate_alternate_flights(answer, flights)
     answer = ensure_flight_legs(answer, flights)
+    answer = lock_flight_currency(answer, flights)
     return answer
 
 
@@ -2009,10 +2327,29 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
             block = render_car_block(evidence)
             if block and "CARS:" not in text:
                 text = text.rstrip() + "\n\n" + block
-            age = stated_driver_age(request)
-            note = driver_age_note(age)
-            if "assumed age" in note.lower() and "assumed age" not in text.lower():
-                text = text.rstrip() + "\n" + note
+            user_text = _human_text(list(state.get("messages") or []))
+            note = driver_age_note(stated_driver_age(user_text))
+            if note == ASSUMED_DRIVER_AGE:
+                text = re.sub(
+                    r"Driver age \d+ was taken from the request\.?",
+                    "",
+                    text,
+                )
+                if ASSUMED_DRIVER_AGE not in text:
+                    text = text.rstrip() + "\n" + note
+            elif note not in text:
+                text = text.replace(ASSUMED_DRIVER_AGE, note)
+            return text.strip()
+        if key == "hotel":
+            messages = result.get("messages") or []
+            evidence = "\n".join(
+                _message_text(item.content) for item in messages if isinstance(item, ToolMessage)
+            )
+            names = extract_skiplagged_hotels(evidence)
+            text = final_text(result)
+            if names and "HOTELS:" not in text:
+                listed = "\n".join(f"- {name}" for name in names)
+                text = text.rstrip() + f"\n\nHOTELS:\n{listed}"
             return text
         if key in {"restaurant", "bar"}:
             messages = result.get("messages") or []
@@ -2102,10 +2439,11 @@ You are a trip planner coordinator.
 First find origin, destination, guest count, and the kind of trip (genre). When you have them, call update_state by itself and wait for it to return.
 Then delegate with search_flights, search_hotels, suggest_rental_cars, suggest_restaurants, and suggest_bars. Independent specialists may be called in parallel; that is faster than waiting for one before the next. Pass each specialist a self-contained request with dates, party size, and preferences from the conversation.
 Use web_search only for gaps the specialists do not cover: events, attractions, travel advisories, and opening hours. Do not put trip dates into web search queries. Do not invent prices, venues, ratings, or hours.
-Keep every hotel the hotel specialist returned. Drop one only when you explain why.
+Keep every hotel the hotel specialist returned. Drop one only when you explain why. Hotel names are property names from the hotel tool. Do not list field labels such as Neighborhood, Nightly rate, Cancellation, or Tradeoff as hotels.
 Name a restaurant or bar only when that specialist's tool output names it as a place. Drop photo credits, bylines, and any other name that is not a returned venue. When a specialist says the source is unavailable, repeat that and name no venues.
 Do not say hours or open status are confirmed for the trip dates unless a tool result states it. Otherwise say check hours before going. Do not relabel cuisine or move a place to a meal the source did not support.
-For flights, keep each itinerary's price, legs, and booking link together. Repeat a warning that arrival is late or that travel eats the trip.
+For flights, keep each itinerary you present (or the top 3) with its price, legs, and booking link. Show the currency Kiwi returned, such as EUR, and do not relabel it as dollars. If a return arrives on a later day, label it next-day arrival. Repeat a warning that arrival is late or that travel eats the trip.
+Do not invent a driver age. When the traveler did not give one, the car search uses 30 and the plan must say exactly: assumed driver age 30 — tell me yours if different. Keep each rental's name, price, vendor, and booking link.
 When the specialists have answered, combine their facts into one itinerary. Name any source that was unavailable. You plan and compare; you do not book.
 """.strip()
 

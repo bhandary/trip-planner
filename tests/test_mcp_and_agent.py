@@ -416,7 +416,9 @@ def test_prompts_match_live_corrections():
     assert "one specialist at a time" not in agent.COORDINATOR_PROMPT
     assert "in parallel" in agent.COORDINATOR_PROMPT
     assert "arrival airport" in agent.RENTAL_PROMPT
-    assert "Assumed age" in agent.driver_age_note(None)
+    assert agent.driver_age_note(None) == "assumed driver age 30 — tell me yours if different"
+    assert "assumed driver age 30 — tell me yours if different" in agent.COORDINATOR_PROMPT
+    assert "assumed driver age 30 — tell me yours if different" in agent.RENTAL_PROMPT
     assert "42" in agent.driver_age_note(42)
     assert "Assumed" not in agent.driver_age_note(42)
     note = agent._source_note("places", None, ["down"])
@@ -763,7 +765,169 @@ def test_car_names_prices_and_assumed_age_stay_in_the_plan():
     text = agent.ensure_cars_kept(answer, specialist)
     assert "Peugeot 2008" in text
     assert "49.4" in text
-    assert "30 is an assumed age" in text
+    assert "CRC Car Rental Company" in text
+    assert "https://cars.example/peugeot" in text
+    assert "assumed driver age 30 — tell me yours if different" in text
+
+
+def test_octotrip_offers_survive_a_heading_only_plan():
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "octotrip_lisbon.json").read_text()
+    )
+    listed = {
+        "results": [
+            {
+                "name": "Peugeot 208",
+                "vendor": "CRC Car Rental Company",
+                "price": 36.89,
+                "currency": "EUR",
+                "category": "Economy",
+                "booking_url": "https://mcp.octotrip.app/rental-cars/r/208",
+            },
+            {
+                "name": "Peugeot 308",
+                "vendor": "CRC Car Rental Company",
+                "price": 40.41,
+                "currency": "EUR",
+                "category": "Compact",
+                "booking_url": "https://mcp.octotrip.app/rental-cars/r/308",
+            },
+            {
+                "name": "BMW 1 Series",
+                "vendor": "Autounion",
+                "price": 64.94,
+                "currency": "EUR",
+                "category": "Compact Elite",
+                "booking_url": "https://mcp.octotrip.app/rental-cars/r/bmw",
+            },
+            {
+                "name": "VW Polo",
+                "vendor": "Record",
+                "price": 36.90,
+                "currency": "EUR",
+                "category": "Economy",
+                "booking_url": "https://mcp.octotrip.app/rental-cars/r/polo",
+            },
+            {
+                "name": "Audi A3",
+                "vendor": "Masterkings",
+                "price": 88.0,
+                "currency": "EUR",
+                "category": "Compact",
+                "booking_url": "https://mcp.octotrip.app/rental-cars/r/a3",
+            },
+        ]
+    }
+    prose = (
+        "Peugeot 208 36.89 EUR from CRC Car Rental Company. "
+        "Peugeot 308 40.41 EUR. BMW 1 Series 64.94 EUR. VW Polo 36.90 EUR."
+    )
+    specialist = prose + "\n\n" + agent.render_car_block(json.dumps(listed))
+    padded = "search note\n" + json.dumps(fixture) + (" " * 25000)
+    parsed = agent.extract_car_offers(padded)
+    assert [offer.name for offer in parsed] == [
+        "Peugeot 2008",
+        "Peugeot 308",
+        "Mercedes-Benz A-Class",
+        "BMW 1 Series",
+    ]
+    assert parsed[0].vendor == "CRC Car Rental Company"
+    assert parsed[0].link.startswith("https://mcp.octotrip.app/rental-cars/r/")
+    answer = "Rental Cars in Lisbon Airport\n\nDriver age 30+."
+    text = agent.apply_coordinator_checks(
+        answer,
+        [
+            HumanMessage(content="Plan a long weekend in Lisbon. I did not mention an age."),
+            ToolMessage(specialist, name="suggest_rental_cars", tool_call_id="cars"),
+        ],
+    )
+    for name in ("Peugeot 208", "Peugeot 308", "BMW 1 Series", "VW Polo"):
+        assert name in text
+    assert "36.89" in text and "40.41" in text and "64.94" in text and "36.90" in text
+    assert "Autounion" in text and "https://mcp.octotrip.app/rental-cars/r/polo" in text
+    assert "Audi A3" not in text
+    assert "assumed driver age 30 — tell me yours if different" in text
+    assert "30+" not in text
+
+
+def test_stated_driver_age_is_not_replaced_with_the_assumption():
+    answer = "Rental car: Peugeot 208. assumed driver age 30 — tell me yours if different"
+    text = agent.enforce_assumed_driver_age(
+        answer,
+        [HumanMessage(content="I am 42 years old.")],
+        "CARS:\n- Peugeot 208 | 36.89 EUR",
+    )
+    assert "Driver age 42 was taken from the request." in text
+    assert "assumed driver age 30" not in text
+
+
+def test_hotel_field_labels_are_not_hotel_names():
+    table = (
+        Path(__file__).parent / "fixtures" / "skiplagged_lisbon_hotels.md"
+    ).read_text()
+    prose = (
+        "**Neighborhood**\nAlfama\n**Nightly rate**\n€67\n"
+        "**Cancellation**\nfree\n**Tradeoff**\ncentral but small\n"
+    )
+    names = agent.extract_hotel_names(prose)
+    assert names == []
+    specialist = prose + "\n\nHOTELS:\n" + "\n".join(
+        f"- {name}" for name in agent.extract_skiplagged_hotels(table)
+    )
+    answer = "Hotels in Lisbon."
+    text = agent.apply_coordinator_checks(
+        answer,
+        [ToolMessage(specialist, name="search_hotels", tool_call_id="hotels")],
+    )
+    assert "Inn Rossio Hotel" in text
+    assert "Hotel ibis Lisboa Jose Malhoa" in text
+    for label in ("Neighborhood", "Nightly rate", "Cancellation", "Tradeoff"):
+        assert label not in text
+
+
+def test_flight_legs_follow_the_presented_itinerary_in_eur():
+    itineraries = []
+    for index in range(15):
+        item = _kiwi_itinerary(
+            765 + index,
+            f"https://kiwi.com/u/{index}",
+            "2027-03-15",
+            "2027-03-18",
+            "2027-03-16",
+        )
+        item["inbound"]["arrivalTime"] = "2027-03-19T12:45:00"
+        item["priceFormatted"] = f"{765 + index} EUR"
+        itineraries.append(item)
+    rendered = agent.render_kiwi_itineraries(
+        {"currency": "EUR", "itineraries": itineraries},
+        {"departureDate": "15/03/2027", "returnDate": "18/03/2027"},
+    )
+    assert "price: 765 EUR" in rendered
+    assert "outbound: next-day arrival (16 Mar)" in rendered
+    assert "return: next-day arrival (19 Mar)" in rendered
+    answer = "One option for the weekend."
+    text = agent.ensure_flight_legs(answer, rendered)
+    assert "https://kiwi.com/u/0" in text
+    assert "https://kiwi.com/u/2" in text
+    assert "https://kiwi.com/u/3" not in text
+    assert "https://kiwi.com/u/14" not in text
+    assert "2027-03-15T08:25:00" in text
+    priced = agent.lock_flight_currency(
+        agent.ensure_flight_legs("One option: $765 on the trip.", rendered),
+        rendered,
+    )
+    assert "https://kiwi.com/u/0" in priced
+    assert "https://kiwi.com/u/1" not in priced
+    assert "$765" not in priced
+    assert "765 EUR" in priced
+    presented = "Book https://kiwi.com/u/4 for this trip at $769."
+    kept = agent.lock_flight_currency(agent.ensure_flight_legs(presented, rendered), rendered)
+    assert "https://kiwi.com/u/4" in kept
+    assert "https://kiwi.com/u/0" not in kept
+    assert "https://kiwi.com/u/14" not in kept
+    assert "$769" not in kept
+    assert "769 EUR" in kept
+    assert "next-day arrival (19 Mar)" in kept
 
 
 def test_flight_specialist_returns_locked_blocks():
@@ -859,7 +1023,7 @@ async def test_octotrip_empty_retries_airport_then_upfront(monkeypatch):
     assert ("get_locations", "Lisbon Airport") in calls
     assert ("get_offers", "Lisbon Airport") in calls
     assert "Upfront" in str(result)
-    assert "Assumed age 30" in str(result)
+    assert "assumed driver age 30 — tell me yours if different" in str(result)
 
 
 @pytest.mark.asyncio
