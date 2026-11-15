@@ -2166,6 +2166,7 @@ def test_flight_and_car_headings_with_periods_are_replaced():
         ],
     )
     assert "### Flights from Washington, D.C." not in flight_text
+    assert "stale listing without a link" not in flight_text
     assert rendered.splitlines()[0] in flight_text
     assert "https://kiwi.com/default-sort" in flight_text
 
@@ -2199,6 +2200,101 @@ def test_flight_and_car_headings_with_periods_are_replaced():
     assert "Old Fiat" not in car_text
     assert "Rental Cars in Lisbon Airport (2027-03-15 to 2027-03-18):" in car_text
     assert "Peugeot 2008" in car_text
+
+
+def test_replaced_flight_heading_drops_generic_stale_bullets():
+    flights = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [_tap_round_trip(320, "https://kiwi.com/default-sort")],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    rendered = agent.render_flight_section(flights)
+    text = agent.apply_coordinator_checks(
+        "### Flights from Washington, D.C.\n"
+        "- stale listing without a link\n"
+        "* another stale offer\n"
+        "- Day 1: Fly TP238 overnight.\n"
+        "Meet at the airport.\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("FLIGHTS", flights),
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ],
+    )
+    assert "stale listing without a link" not in text
+    assert "another stale offer" not in text
+    assert "- Day 1: Fly TP238 overnight." in text
+    assert "Meet at the airport." in text
+    assert rendered.splitlines()[0] in text
+
+
+def test_price_outbound_return_and_repeated_booking_lines_are_dropped():
+    flights = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [_tap_round_trip(320, "https://kiwi.com/default-sort")],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    hotels = {
+        "city": "Lisbon",
+        "checkin": "2027-03-15",
+        "checkout": "2027-03-18",
+        "hotels": [
+            {
+                "name": "Inn Rossio Hotel",
+                "nightly": "€67",
+                "total": "€231",
+                "link": "https://skiplagged.com/hotel/1",
+            }
+        ],
+    }
+    flight_rendered = agent.render_flight_section(flights)
+    hotel_rendered = agent.render_hotel_section(hotels)
+    text = agent.apply_coordinator_checks(
+        "Flights:\n"
+        "Price: 320 EUR\n"
+        "Outbound: TAP TP238 LIS to OPO\n"
+        "Return: TAP TP237 OPO to LIS\n"
+        "Return the key at the desk.\n"
+        "Hotels:\n"
+        "Booking: https://skiplagged.com/hotel/1\n"
+        "Booking: https://example.com/elsewhere\n"
+        "Walk to the river after check-in.\n",
+        [
+            ToolMessage(
+                hotel_rendered + "\n" + agent.format_structured("HOTELS", hotels),
+                name="search_hotels",
+                tool_call_id="hotels",
+            ),
+            ToolMessage(
+                flight_rendered + "\n" + agent.format_structured("FLIGHTS", flights),
+                name="search_flights",
+                tool_call_id="flights",
+            ),
+        ],
+    )
+    assert "Price: 320 EUR" not in text
+    assert "Outbound: TAP TP238" not in text
+    assert "Return: TAP TP237" not in text
+    assert "Return the key at the desk." in text
+    assert text.count("https://skiplagged.com/hotel/1") == 1
+    assert "Booking: https://example.com/elsewhere" in text
+    assert "Walk to the river after check-in." in text
+    assert "Inn Rossio Hotel" in text
+    assert flight_rendered.splitlines()[0] in text
 
 
 def test_leg_key_accepts_fractional_seconds_and_zulu():

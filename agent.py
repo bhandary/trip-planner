@@ -2420,6 +2420,27 @@ _FLIGHT_PRICE = re.compile(
 )
 
 
+_FLIGHT_FIELD = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:\*\*)?(price|outbound|return)(?:\*\*)?\s*:\s*\S",
+    re.I,
+)
+
+
+def _line_restates_flight_fields(line: str, record: dict[str, Any]) -> bool:
+    """A short Price / Outbound / Return line that repeats the first rendered itinerary."""
+    if not _FLIGHT_FIELD.match(line) or len(line.strip()) > 160:
+        return False
+    itineraries = [item for item in record.get("itineraries") or [] if isinstance(item, dict)]
+    if not itineraries:
+        return False
+    first = itineraries[0]
+    price = str(first.get("price") or "").split()[0]
+    if price and price in line:
+        return True
+    numbers = _record_flight_numbers({"itineraries": [first]})
+    return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
+
+
 def _line_mentions_flight_number(line: str, numbers: set[str]) -> bool:
     return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
 
@@ -2462,6 +2483,8 @@ def replace_flight_section(answer: str, record: dict[str, Any]) -> str:
         if flight_links and any(link not in kept for link in flight_links):
             return False
         if _line_restates_itinerary(line, kept, numbers):
+            return False
+        if _line_restates_flight_fields(line, record):
             return False
         return True
 
@@ -3044,6 +3067,11 @@ def _skippable_section_line(kind: str, line: str) -> bool:
         return True
     if kind == "hotels" and (stripped.startswith(("-", "*", "•")) or stripped.startswith("**")):
         return True
+    if kind == "flights" and stripped.startswith(("-", "*", "•")):
+        # A day line is the itinerary. Other bullets are the old flight list.
+        if re.match(r"[-*•]\s*day\s+\d+\b", stripped, re.I):
+            return False
+        return True
     return False
 
 
@@ -3122,6 +3150,13 @@ def _list_item_body(line: str) -> str | None:
     return re.sub(r"[*_`]", "", match.group(1)).strip()
 
 
+def _booking_line_repeats_hotel(line: str, links: set[str]) -> bool:
+    """A 'Booking:' line whose only job is to repeat a URL already in the hotel block."""
+    if not links or not re.match(r"^\s*(?:[-*•]\s*)?(?:\*\*)?booking(?:\*\*)?\s*:", line, re.I):
+        return False
+    return any(link in line for link in links)
+
+
 def _line_restates_hotel(line: str, names: list[str]) -> bool:
     """A list item whose text starts with a hotel already in the rendered block."""
     body = _list_item_body(line)
@@ -3154,11 +3189,18 @@ def replace_hotel_section(answer: str, record: dict[str, Any]) -> str:
     section = render_hotel_section(record)
     text = replace_named_section(answer, "hotels", section)
     names = _hotel_names(record)
+    links = {
+        str(hotel.get("link"))
+        for hotel in record.get("hotels") or []
+        if isinstance(hotel, dict) and hotel.get("link")
+    }
 
     def keep(line: str) -> bool:
         if _label_only_line(line):
             return False
         if _line_restates_hotel(line, names):
+            return False
+        if _booking_line_repeats_hotel(line, links):
             return False
         return True
 
