@@ -57,7 +57,7 @@ make probe
 | Rental cars | [OctoTrip](https://mcp.octotrip.app/rental-cars/mcp) | [Upfront Rentals](https://www.upfront-rentals.com/MCP/Streamable) |
 | Restaurants and bars | [Google Maps Grounding Lite](https://mapstools.googleapis.com/mcp) | none |
 
-Kiwi, lastminute.com, Skiplagged, OctoTrip, and Upfront Rentals are called with no API key. Google Maps is added only when `GOOGLE_MAPS_KEY` or `GOOGLE_MAPS_API_KEY` is set, and the header is `X-Goog-Api-Key`. If that key is missing, the restaurant and bar agents skip Maps and say so.
+Kiwi, lastminute.com, Skiplagged, OctoTrip, and Upfront Rentals are called with no API key. OctoTrip blocks the default HTTP client user agent, so the car agent sends `User-Agent: Mozilla/5.0 (compatible; trip-planner/1.0)`. Google Maps is added only when `GOOGLE_MAPS_KEY` or `GOOGLE_MAPS_API_KEY` is set, and the header is `X-Goog-Api-Key`. If that key is missing, the restaurant and bar agents skip Maps and say so.
 
 Tavily (`langchain-tavily`) is a general web search tool for gaps: events, attractions, advisories, hours, and fees. It is not a substitute for live MCP prices. Without `TAVILY_API_KEY` the tool returns an error payload instead of raising.
 

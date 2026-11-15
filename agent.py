@@ -84,17 +84,21 @@ def google_maps_key() -> str:
 
 def mcp_targets() -> dict[str, Any]:
     """Streamable HTTP MCP targets. ``places`` is omitted until a Maps key is set."""
+    # OctoTrip rejects the default HTTP client user agent (ua_blocked).
+    from fastmcp.client.transports import StreamableHttpTransport
+
     targets: dict[str, Any] = {
         "kiwi": KIWI_URL,
         "hotels": HOTELS_URL,
         "hotels_alt": HOTELS_ALT_URL,
-        "cars": CARS_URL,
+        "cars": StreamableHttpTransport(
+            CARS_URL,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; trip-planner/1.0)"},
+        ),
         "cars_alt": CARS_ALT_URL,
     }
     key = google_maps_key()
     if key:
-        from fastmcp.client.transports import StreamableHttpTransport
-
         targets["places"] = StreamableHttpTransport(
             PLACES_URL,
             headers={"X-Goog-Api-Key": key},

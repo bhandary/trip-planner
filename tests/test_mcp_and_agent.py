@@ -76,7 +76,8 @@ def test_places_omitted_without_key():
     assert targets["kiwi"] == KIWI_URL
     assert targets["hotels"] == HOTELS_URL
     assert targets["hotels_alt"] == HOTELS_ALT_URL
-    assert targets["cars"] == CARS_URL
+    assert str(targets["cars"].url) == CARS_URL
+    assert "trip-planner" in targets["cars"].headers["User-Agent"]
     assert targets["cars_alt"] == CARS_ALT_URL
     assert google_maps_key() == ""
 
