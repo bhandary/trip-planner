@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,7 +62,8 @@ def test_rental_prompt_is_not_the_hotel_prompt():
 
 
 def test_default_model_is_hosted_openai():
-    assert resolve_model_name() == "openai:gpt-5-nano"
+    assert resolve_model_name() == "openai:gpt-4.1-mini"
+    assert agent.DEFAULT_MODEL == "openai:gpt-4.1-mini"
     assert "ollama" not in resolve_model_name()
 
 
@@ -406,3 +408,310 @@ def test_coordinator_tools():
 def test_graph_imports_without_credentials():
     assert agent.graph is not None
     assert agent.graph.name == "trip_planner"
+
+
+def test_prompts_match_live_corrections():
+    assert "only look for one ticket, one way" not in agent.FLIGHT_PROMPT
+    assert "return flight on the trip end date" in agent.FLIGHT_PROMPT
+    assert "one specialist at a time" not in agent.COORDINATOR_PROMPT
+    assert "in parallel" in agent.COORDINATOR_PROMPT
+    assert "arrival airport" in agent.RENTAL_PROMPT
+    assert "Assumed age" in agent.driver_age_note(None)
+    assert "42" in agent.driver_age_note(42)
+    assert "Assumed" not in agent.driver_age_note(42)
+    note = agent._source_note("places", None, ["down"])
+    assert "venues" in note and "ratings" in note and "hours" in note
+    assert "Do not put trip dates" in agent.RESTAURANT_PROMPT
+    assert "check hours before going" in " ".join(agent.BAR_PROMPT.split())
+    assert "shrimp stew" in agent.RESTAURANT_PROMPT
+
+
+def test_strip_trip_dates_leaves_the_place():
+    assert agent.strip_trip_dates("lisbon restaurants on 2027-03-15") == "lisbon restaurants"
+    assert "March" not in agent.strip_trip_dates("bars in Lisbon March 15, 2027")
+
+
+@pytest.mark.asyncio
+async def test_web_search_strips_dates_before_tavily(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test")
+    seen = []
+
+    class Capture:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ainvoke(self, payload):
+            seen.append(payload["query"])
+            return "ok"
+
+    monkeypatch.setattr(agent, "TavilySearch", Capture)
+    await web_search.ainvoke(
+        {"query": "lisbon restaurants 2027-03-15", "search_number": 1, "max_search_number": 3}
+    )
+    assert seen == ["lisbon restaurants"]
+
+
+def test_credits_are_not_venues_and_headings_are():
+    blob = (
+        "Photo: Rafael Tonon\n"
+        "## The 10 Best Restaurants in Lisbon\n"
+        "## Cervejaria Ramiro\n"
+        '{"displayName": {"text": "Santa Joana"}, "formattedAddress": "Lisbon", '
+        '"rating": 4.2, "editorialSummary": "shrimp stew"}\n'
+        "## Antiga Wine Bar\n"
+        "Best for lunch."
+    )
+    names = agent.extract_grounded_venues(blob)
+    assert "Cervejaria Ramiro" in names
+    assert "Santa Joana" in names
+    assert "Antiga Wine Bar" in names
+    assert "Rafael Tonon" not in names
+    assert all("Best" not in name for name in names)
+
+
+def test_no_venue_data_names_nothing():
+    text = agent.render_grounded_specialist(
+        "Dinner at **Rafael Tonon**.",
+        set(),
+        "Photo: Rafael Tonon",
+        tools_called=True,
+    )
+    assert "Rafael Tonon" not in text
+    assert "unavailable" in text.lower()
+    assert "VENUES: (none)" in text
+
+
+def test_hours_cuisine_and_meal_are_not_overclaimed():
+    evidence = (
+        "## Santa Joana\nshrimp stew. No hours listed.\n"
+        "## Antiga Wine Bar\nBest for lunch."
+    )
+    answer = (
+        "**Santa Joana** is vegetarian and hours are confirmed for the trip.\n"
+        "Dinner at **Antiga Wine Bar**."
+    )
+    text = agent.scrub_unconfirmed_hours(answer, evidence)
+    text = agent.scrub_overclaims(text, evidence, {"Santa Joana", "Antiga Wine Bar"})
+    assert "confirmed" not in text.lower()
+    assert "check hours before going" in text.lower()
+    assert "vegetarian" not in text.lower()
+    assert "Dinner at" not in text
+    assert "lunch" in text.lower()
+
+
+def test_coordinator_drops_credit_and_keeps_hotels_and_grounded_venues():
+    messages = [
+        ToolMessage(
+            "**Ibis Parque das Nações** — 90 EUR",
+            name="search_hotels",
+            tool_call_id="h",
+        ),
+        ToolMessage(
+            "**Cervejaria Ramiro**\nVENUES: Cervejaria Ramiro",
+            name="suggest_restaurants",
+            tool_call_id="r",
+        ),
+        ToolMessage("VENUES: (none)", name="suggest_bars", tool_call_id="b"),
+    ]
+    answer = "Skip the hotels.\nDinner at **Rafael Tonon**.\nAlso **Cervejaria Ramiro**."
+    text = agent.apply_coordinator_checks(answer, messages)
+    assert "Rafael Tonon" not in text
+    assert "Cervejaria Ramiro" in text
+    assert "Ibis Parque das Nações" in text
+    assert "unavailable" in text.lower()
+
+
+def test_hotel_omission_with_a_reason_is_kept():
+    answer = "Excluded Ibis Parque das Nações because it is sold out."
+    text = agent.ensure_hotels_kept(answer, ["Ibis Parque das Nações"])
+    assert text == answer
+    assert "Hotels returned" not in text
+
+
+def test_kiwi_itinerary_fields_stay_together_and_warn():
+    payload = {
+        "itineraries": [
+            {
+                "price": 1805,
+                "currency": "EUR",
+                "bookingUrl": "https://kiwi.com/a",
+                "route": [
+                    {
+                        "flyFrom": "JFK",
+                        "flyTo": "LIS",
+                        "local_departure": "2027-03-15T18:00",
+                        "local_arrival": "2027-03-16T06:00",
+                    }
+                ],
+            },
+            {
+                "price": 1878,
+                "currency": "EUR",
+                "bookingUrl": "https://kiwi.com/b",
+                "route": [
+                    {
+                        "flyFrom": "LIS",
+                        "flyTo": "JFK",
+                        "local_departure": "2027-03-18T12:00",
+                        "local_arrival": "2027-03-18T18:00",
+                    }
+                ],
+            },
+        ]
+    }
+    rendered = agent.render_kiwi_itineraries(
+        payload, {"departureDate": "2027-03-15", "returnDate": "2027-03-18"}
+    )
+    first, second = rendered.split("ITINERARY 2", 1)
+    assert "1805" in first and "https://kiwi.com/a" in first
+    assert "https://kiwi.com/b" not in first
+    assert "1878" in second and "https://kiwi.com/b" in second
+    assert "https://kiwi.com/a" not in second
+    assert "day or more after the trip start" in rendered
+    mixed = "The 1805 EUR trip books at https://kiwi.com/b and the return is separate."
+    repaired = agent.repair_flight_pairing(mixed, rendered)
+    assert "intact" in repaired
+    assert "https://kiwi.com/a" in repaired and "https://kiwi.com/b" in repaired
+
+
+def test_flight_specialist_returns_locked_blocks():
+    result = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search-flight",
+                        "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                        "id": "c1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                json.dumps(
+                    {
+                        "price": 317,
+                        "currency": "EUR",
+                        "bookingUrl": "https://kiwi.com/u/one",
+                        "route": [
+                            {
+                                "flyFrom": "JFK",
+                                "flyTo": "LIS",
+                                "local_departure": "2027-03-15T10:00",
+                                "local_arrival": "2027-03-15T18:00",
+                            }
+                        ],
+                    }
+                ),
+                name="search-flight",
+                tool_call_id="c1",
+            ),
+        ]
+    }
+    text = agent.flight_specialist_text(result)
+    assert text is not None
+    assert "317" in text and "https://kiwi.com/u/one" in text
+    assert "ITINERARY 1" in text
+
+
+@pytest.mark.asyncio
+async def test_empty_result_uses_same_name_fallback():
+    async def primary(_args):
+        return {"results": [], "status": "no_results"}
+
+    class Alt:
+        name = "search_hotels"
+
+        async def ainvoke(self, args):
+            return {"ok": args["city"]}
+
+    result = await invoke_with_fallback("search_hotels", primary, [Alt()], {"city": "Lisbon"})
+    assert result == {"ok": "Lisbon"}
+
+
+@pytest.mark.asyncio
+async def test_octotrip_empty_retries_airport_then_upfront(monkeypatch):
+    from langchain_core.tools import StructuredTool
+
+    calls = []
+
+    async def search(location: str, pickup_date: str = "", dropoff_date: str = ""):
+        calls.append(("search", location))
+        return {"results": [], "status": "no_results"}
+
+    async def get_locations(location: str = "", query: str = ""):
+        calls.append(("get_locations", location or query))
+        return [{"name": "LIS"}]
+
+    async def get_offers(location: str = "", pickup_location: str = "", pickup_date: str = "", dropoff_date: str = ""):
+        calls.append(("get_offers", location or pickup_location))
+        return [{"vehicle": "Micra", "price": 100}]
+
+    tool = StructuredTool.from_function(coroutine=search, name="search", description="search cars")
+    wrapped = agent.attach_call_fallback(tool, "cars_alt")
+
+    async def fake_list(name):
+        assert name == "cars_alt"
+        return [
+            StructuredTool.from_function(coroutine=get_locations, name="get_locations", description="locs"),
+            StructuredTool.from_function(coroutine=get_offers, name="get_offers", description="offers"),
+        ]
+
+    monkeypatch.setattr(agent, "list_server_tools", fake_list)
+    result = await wrapped.ainvoke(
+        {"location": "Lisbon", "pickup_date": "2027-03-15", "dropoff_date": "2027-03-18"}
+    )
+    assert calls[0] == ("search", "Lisbon")
+    assert calls[1] == ("search", "Lisbon Airport")
+    assert ("get_locations", "Lisbon Airport") in calls
+    assert ("get_offers", "Lisbon Airport") in calls
+    assert "Upfront" in str(result)
+    assert "Assumed age 30" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_list_tools_retries_before_fallback(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(agent.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(agent, "_max_retries", lambda: 3)
+    state = {"n": 0}
+
+    class Adapter:
+        def __init__(self, target):
+            self.target = target
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def list_tools(self, cache_mode="bypass"):
+            state["n"] += 1
+            if state["n"] < 3:
+                raise MCPError(-32603, "internal")
+            return ["kiwi-tool"]
+
+    monkeypatch.setattr("langchain.mcp.MCPAdapter", Adapter)
+    tools = await agent.list_server_tools("kiwi")
+    assert tools == ["kiwi-tool"]
+    assert state["n"] == 3
+    assert sleeps == [1, 2]
+
+    state["n"] = 0
+
+    class BadAdapter(Adapter):
+        async def list_tools(self, cache_mode="bypass"):
+            state["n"] += 1
+            raise MCPError(-32602, "bad")
+
+    monkeypatch.setattr("langchain.mcp.MCPAdapter", BadAdapter)
+    agent.clear_mcp_cache()
+    with pytest.raises(MCPError):
+        await agent.list_server_tools("kiwi")
+    assert state["n"] == 1

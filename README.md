@@ -16,7 +16,7 @@ pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-The default model is OpenAI `gpt-5-nano` (`openai:gpt-5-nano`). Change it with `OPENAI_MODEL` or `TRIP_PLANNER_MODEL` (for example `openai:gpt-5-nano`). Production uses that hosted model. There is no local model server.
+The default model is OpenAI `gpt-4.1-mini` (`openai:gpt-4.1-mini`). Change it with `OPENAI_MODEL` or `TRIP_PLANNER_MODEL` (for example `openai:gpt-4.1-mini`). Production uses that hosted model. There is no local model server.
 
 ## Run the backend and the UI
 

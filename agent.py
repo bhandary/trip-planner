@@ -10,13 +10,16 @@ server's tools plus Tavily ``web_search``.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
+import uuid
+from datetime import date, timedelta
 from typing import Any, Awaitable, Callable
 
 from dotenv import load_dotenv
 from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import wrap_tool_call
+from langchain.agents.middleware import after_model, wrap_tool_call
 from langchain.chat_models import init_chat_model
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from langchain.tools import ToolRuntime, tool
@@ -33,7 +36,7 @@ from typing_extensions import NotRequired
 load_dotenv()
 
 RETRYABLE_MCP_CODES = {-32603}
-DEFAULT_MODEL = "openai:gpt-5-nano"
+DEFAULT_MODEL = "openai:gpt-4.1-mini"
 
 KIWI_URL = "https://mcp.kiwi.com"
 HOTELS_URL = "https://mcp.lastminute.com/mcp"
@@ -167,11 +170,15 @@ async def list_server_tools(server_name: str) -> list[BaseTool]:
     from langchain.mcp import MCPAdapter
 
     target = targets[server_name]
-    async with MCPAdapter(target) as adapter:
-        tools = await asyncio.wait_for(
-            adapter.list_tools(cache_mode="bypass"),
-            timeout=_timeout_seconds(),
-        )
+
+    async def _list() -> list[BaseTool]:
+        async with MCPAdapter(target) as adapter:
+            return await asyncio.wait_for(
+                adapter.list_tools(cache_mode="bypass"),
+                timeout=_timeout_seconds(),
+            )
+
+    tools = await call_with_retry(_list)
     _tool_cache[server_name] = list(tools)
     return _tool_cache[server_name]
 
@@ -200,6 +207,52 @@ async def load_with_fallback(
     return [], None, errors
 
 
+class EmptySource(Exception):
+    """A tool call succeeded but returned no usable rows."""
+
+    def __init__(self, result: Any):
+        self.result = result
+        super().__init__("no_results")
+
+
+def result_is_empty(value: Any) -> bool:
+    """True when a supplier returned no rows, including an explicit no_results."""
+    if value is None:
+        return True
+    if isinstance(value, tuple) and value:
+        return result_is_empty(value[0])
+    if isinstance(value, list):
+        if not value:
+            return True
+        if all(isinstance(item, dict) and "text" in item for item in value):
+            return all(result_is_empty(item.get("text")) for item in value)
+        return False
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() in {"", "null", "none", "[]", "{}", "no results", "no_results"}:
+            return True
+        if re.search(r"\bno[_\s-]?results\b", text, re.I):
+            return True
+        try:
+            return result_is_empty(json.loads(text))
+        except json.JSONDecodeError:
+            return False
+    if isinstance(value, dict):
+        if not value:
+            return True
+        if value.get("no_results") is True:
+            return True
+        status = str(value.get("status") or value.get("error") or "").lower()
+        if status in {"no_results", "empty", "not_found"}:
+            return True
+        for key in ("results", "offers", "cars", "vehicles", "itineraries", "data"):
+            if key in value and value[key] in (None, [], {}):
+                return True
+        if value.get("count") == 0:
+            return True
+    return False
+
+
 def _tool_result(tool: BaseTool, value: Any) -> Any:
     if getattr(tool, "response_format", "content") != "content_and_artifact":
         return value
@@ -208,30 +261,127 @@ def _tool_result(tool: BaseTool, value: Any) -> Any:
     return (value, None)
 
 
+def _tool_by_name(tools: list[BaseTool], name: str) -> BaseTool | None:
+    return next((candidate for candidate in tools if candidate.name == name), None)
+
+
+def _accepted_args(tool: BaseTool, raw: dict[str, Any]) -> dict[str, Any]:
+    schema = getattr(tool, "args_schema", None)
+    props: dict[str, Any] = {}
+    if schema is not None and hasattr(schema, "model_json_schema"):
+        props = schema.model_json_schema().get("properties") or {}
+    elif isinstance(schema, dict):
+        props = schema.get("properties") or {}
+    filled = {key: value for key, value in raw.items() if value not in ("", None)}
+    if not props:
+        return filled
+    return {key: value for key, value in filled.items() if key in props}
+
+
+def driver_age_note(age: Any) -> str:
+    """Use a stated age. Otherwise say the search assumed 30 and flag it."""
+    if age is None or str(age).strip() == "":
+        return (
+            "No driver age was stated. Assumed age 30 for this search. "
+            "Prices may change for a different age."
+        )
+    return f"Driver age {age} was taken from the request."
+
+
+def airport_args_for(args: dict[str, Any]) -> dict[str, Any] | None:
+    """Retry a city pickup at that city's airport. Leave an airport query alone."""
+    for key in ("location", "pickup", "pickup_location", "pickUpLocation", "city"):
+        value = args.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if re.search(r"\bairport\b", value, re.I):
+            return None
+        updated = dict(args)
+        airport = value.strip().rstrip(".") + " Airport"
+        updated[key] = airport
+        for drop_key in ("dropoff_location", "dropoff", "dropOffLocation", "dropoff_location"):
+            current = updated.get(drop_key)
+            if isinstance(current, str) and current.strip() and not re.search(r"\bairport\b", current, re.I):
+                updated[drop_key] = airport
+        return updated
+    return None
+
+
+async def upfront_search_fallback(alt_tools: list[BaseTool], args: dict[str, Any]) -> str | None:
+    """Map an OctoTrip search onto Upfront get_locations + get_offers."""
+    locations = _tool_by_name(alt_tools, "get_locations")
+    offers = _tool_by_name(alt_tools, "get_offers")
+    if locations is None or offers is None:
+        return None
+    location = (
+        args.get("location")
+        or args.get("pickup")
+        or args.get("pickup_location")
+        or args.get("city")
+        or ""
+    )
+    pickup_date = args.get("pickup_date") or args.get("pickupDate") or args.get("from") or ""
+    dropoff_date = args.get("dropoff_date") or args.get("dropoffDate") or args.get("to") or ""
+    try:
+        loc_result = await locations.ainvoke(_accepted_args(locations, {"location": location, "query": location}))
+    except Exception as exc:
+        loc_result = f"get_locations failed: {exc}"
+    offer_raw = {
+        "location": location,
+        "pickup_location": location,
+        "pickup": location,
+        "pickup_date": pickup_date,
+        "dropoff_date": dropoff_date,
+        "pickupDate": pickup_date,
+        "dropoffDate": dropoff_date,
+    }
+    try:
+        offer_result = await offers.ainvoke(_accepted_args(offers, offer_raw) or offer_raw)
+    except Exception as exc:
+        offer_result = f"get_offers failed: {exc}"
+    return (
+        "OctoTrip search returned no results. Fallback source: Upfront Rentals "
+        "(get_locations + get_offers).\n"
+        f"locations: {loc_result}\n"
+        f"offers: {offer_result}"
+    )
+
+
 async def invoke_with_fallback(
     primary_name: str,
     primary_call: Callable[[dict[str, Any]], Awaitable[Any]],
     alt_tools: list[BaseTool],
     args: dict[str, Any],
 ) -> Any:
-    """Call the primary tool. If it fails, call the alt tool of the same name."""
+    """Call the primary tool. On error, timeout, or empty/no_results, use the alt."""
     try:
-        return await primary_call(args)
+        result = await primary_call(args)
     except Exception as exc:
-        alt = next((candidate for candidate in alt_tools if candidate.name == primary_name), None)
-        if alt is None:
-            return (
-                f"Source unavailable ({primary_name}). "
-                f"Primary failed: {exc}. "
-                f"No fallback tool named {primary_name}."
-            )
-        try:
-            return await alt.ainvoke(args)
-        except Exception as alt_exc:
-            return (
-                f"Source unavailable ({primary_name}). "
-                f"Primary: {exc}. Fallback: {alt_exc}."
-            )
+        failure: BaseException = exc
+    else:
+        if not result_is_empty(result):
+            return result
+        failure = EmptySource(result)
+
+    if primary_name == "search":
+        mapped = await upfront_search_fallback(alt_tools, args)
+        if mapped is not None:
+            return mapped
+
+    alt = _tool_by_name(alt_tools, primary_name)
+    if alt is None:
+        return (
+            f"Source unavailable ({primary_name}). "
+            f"Primary failed: {failure}. "
+            f"No fallback tool named {primary_name}."
+        )
+    try:
+        return await alt.ainvoke(args)
+    except Exception as alt_exc:
+        return (
+            f"Source unavailable ({primary_name}). "
+            f"Primary: {failure}. Fallback: {alt_exc}."
+        )
 
 
 def attach_call_fallback(tool: BaseTool, alt_server: str) -> BaseTool:
@@ -244,10 +394,24 @@ def attach_call_fallback(tool: BaseTool, alt_server: str) -> BaseTool:
 
     async def wrapped(**kwargs: Any) -> Any:
         async def primary_call(args: dict[str, Any]) -> Any:
-            return await call_with_retry(lambda: original(**args))
+            result = await call_with_retry(lambda: original(**args))
+            if (
+                result_is_empty(result)
+                and tool.name == "search"
+                and alt_server == "cars_alt"
+            ):
+                airport_args = airport_args_for(args)
+                if airport_args is not None:
+                    retried = await call_with_retry(lambda: original(**airport_args))
+                    if not result_is_empty(retried):
+                        return retried
+                    raise EmptySource(retried)
+            if result_is_empty(result):
+                raise EmptySource(result)
+            return result
 
         try:
-            return await primary_call(kwargs)
+            result = await primary_call(kwargs)
         except Exception as exc:
             try:
                 alt_tools = await list_server_tools(alt_server)
@@ -263,10 +427,23 @@ def attach_call_fallback(tool: BaseTool, alt_server: str) -> BaseTool:
             async def already_failed(_args: dict[str, Any]) -> Any:
                 raise exc
 
-            result = await invoke_with_fallback(tool.name, already_failed, alt_tools, kwargs)
-            if isinstance(result, tuple):
-                return result
-            return _tool_result(tool, result)
+            fallback_args = kwargs
+            if tool.name == "search" and alt_server == "cars_alt" and isinstance(exc, EmptySource):
+                fallback_args = airport_args_for(kwargs) or kwargs
+            result = await invoke_with_fallback(
+                tool.name, already_failed, alt_tools, fallback_args
+            )
+        if tool.name == "search" and alt_server == "cars_alt":
+            note = driver_age_note(kwargs.get("age") or kwargs.get("driver_age"))
+            if isinstance(result, str):
+                result = f"{result}\n{note}"
+            elif isinstance(result, tuple) and result:
+                result = (f"{result[0]}\n{note}", result[1])
+            else:
+                result = f"{result}\n{note}"
+        if isinstance(result, tuple):
+            return result
+        return _tool_result(tool, result)
 
     tool.coroutine = wrapped
     setattr(tool, "_trip_fallback", True)
@@ -280,7 +457,8 @@ def _source_note(label: str, source: str | None, errors: list[str]) -> str:
     if source is None:
         return (
             f"\n\nLive {label} data is unavailable ({detail}). "
-            "Say that clearly. Do not invent prices or availability."
+            "Say that the source is unavailable. Do not invent venues, ratings, "
+            "hours, prices, or availability."
         )
     return (
         f"\n\nPrimary {label} server failed ({detail}). "
@@ -304,6 +482,7 @@ async def web_search(query: str, search_number: int, max_search_number: int) -> 
         }
     if not os.getenv("TAVILY_API_KEY", "").strip():
         return {"error": "Tavily unavailable: TAVILY_API_KEY is not set"}
+    query = strip_trip_dates(query)
     try:
         search = TavilySearch(max_results=5)
         result = await search.ainvoke({"query": query})
@@ -318,7 +497,9 @@ You are not allowed to ask any more follow up questions, you must find the best 
 - Price (lowest, economy class)
 - Duration (shortest)
 - Date (time of year which you believe is best, unless the task already names dates)
-To make things easy, only look for one ticket, one way.
+When the trip implies a return (a stay, a round trip, or an end date), search the outbound flight on the trip start date and the return flight on the trip end date. Search one-way only when the traveler asked for one-way.
+Each Kiwi itinerary block is one result. Copy its price, legs, and booking link together. Never attach one itinerary's booking link or price to another itinerary's legs.
+If a block warns that arrival is a day or more after the trip start, or that the trip is mostly eaten by travel, repeat that warning.
 You may need to make multiple searches to iteratively find the best options.
 You will be given the origin and destination. It is your job to think critically about the best options.
 If an MCP tool fails, returns malformed output, or does not give you usable flight results, try the tool again.
@@ -367,11 +548,13 @@ example insurance excess, young-driver fees, or cross-border rules), and say whi
 facts came from web search because they may be stale. Do not replace live rates
 with web search.
 
-Before searching, check that you have pickup location, pickup and drop-off dates
-and times, and driver age if the task depends on it. If one is missing and you
-cannot infer it from the task, return a short message naming what is missing
-instead of guessing. Vehicle class, transmission, and budget are optional; apply
-them when given.
+For a fly-in trip, default pickup and drop-off to the arrival airport unless the
+task names a different place. If a city search returns no_results, search that
+city's airport before giving up.
+Do not guess a driver age. If the task states an age, use that age. If it does
+not, the search assumes age 30: say that the age was assumed and that the price
+may change. Vehicle class, transmission, and budget are optional; apply them
+when given.
 
 Return 3 to 5 options, ranked by fit. For each one give: supplier, vehicle class,
 pickup location, total price and currency, whether taxes and insurance are included,
@@ -394,23 +577,32 @@ Use web search to fill gaps those tools leave, such as current menus, tasting
 menu prices, reservation difficulty, or recent closures, and flag facts that
 came from web search. Do not replace a places result with a web-only listing
 when the places tools already answered the question.
+Do not put trip dates into places or web search queries.
 
-Work from the location, date, meal, and party size in the task. If the task
+Name a venue only when a places tool returned it as a place, or when a Tavily
+result has a clearly named venue heading or entry. Never use a person, byline,
+or photo credit as a restaurant. If places and web search both have no venue
+data, say the source is unavailable and name nothing.
+
+Work from the location, meal, and party size in the task. If the task
 includes a hotel or activity location, prefer places within a short walk or
 drive of it and state the distance. Treat dietary restrictions and allergies as
 hard constraints: only include a place when you have evidence it can accommodate
 them, and say what that evidence is. Cuisine, budget, and atmosphere are
-preferences; honor them where you can.
+preferences; honor them where you can. Do not relabel cuisine beyond the source.
+If the source lists shrimp stew, do not call the place vegetarian. Do not
+recommend a meal the source did not mention: if the source says lunch, do not
+recommend the place for dinner.
 
 Return 3 to 5 options per meal requested, with some variety in price and style
-unless the task is narrow. For each give: name, cuisine, neighborhood and
-distance from the reference point, price level, rating, hours for the requested
-day, whether reservations are needed and how to book, and one sentence on why
-it fits this traveler.
+unless the task is narrow. For each give: name, cuisine as the source states it,
+neighborhood and distance from the reference point, price level, rating, and
+hours only when a tool stated them. Say whether reservations are needed and how
+to book, and one sentence on why it fits this traveler.
 
-Confirm each place is open on the requested day before including it. Report
-only details a tool returned; if you could not verify hours or a dietary need,
-say so. You recommend; you do not make reservations.
+Do not say hours or open status are confirmed for the trip dates unless a tool
+result states that. Otherwise say check hours before going. Report only details
+a tool returned. You recommend; you do not make reservations.
 """.strip()
 
 BAR_PROMPT = """
@@ -425,14 +617,20 @@ missing: drink focus, atmosphere, cover charges, dress codes, live music
 schedules, and whether a place has closed recently. Flag facts that came from
 web search. Do not replace a places result with web search when the places
 tools already answered the question.
+Do not put trip dates into places or web search queries.
+Name a venue only when a places tool returned it as a place, or when a Tavily
+result has a clearly named venue heading or entry. Never use a person, byline,
+or photo credit as a bar. If places and web search both have no venue data,
+say the source is unavailable and name nothing.
 
-Work from the location, date, and time window in the task. Match the type of
+Work from the location and time window in the task. Match the type of
 venue to what was asked (cocktail bar, brewery or taproom, wine bar, rooftop,
 dive, live music, sports bar) and do not substitute a different type without
 saying so. If the task mentions a dinner spot or hotel, prefer venues within
 walking distance of it and state the distance, since travelers who are drinking
 should not need to drive. Mention late-night transport options when a venue is
-far from the hotel.
+far from the hotel. Do not relabel the venue beyond the source, and do not
+move it to a meal or night the source did not mention.
 
 Return 3 to 5 options. For each give: name, type, neighborhood and distance
 from the reference point, price level, rating, hours for the requested night,
@@ -441,8 +639,9 @@ atmosphere and what it is known for.
 
 Assume all travelers are of legal drinking age for the destination unless the
 task says otherwise; if the party includes minors, only include venues that
-admit them and say so. Confirm each place is open on the requested night.
-Report only details a tool returned. You recommend; you do not book.
+admit them and say so. Do not say hours or open status are confirmed for the
+trip dates unless a tool result states that. Otherwise say check hours before
+going. Report only details a tool returned. You recommend; you do not book.
 """.strip()
 
 
@@ -702,6 +901,8 @@ async def build_specialists(model: BaseChatModel | None = None) -> dict[str, Any
             ["places: skipped, set GOOGLE_MAPS_KEY or GOOGLE_MAPS_API_KEY"],
         )
 
+    flight_tools = [attach_flight_binding(item) for item in flight_tools]
+    place_tools = [attach_date_strip(item) for item in place_tools]
     if hotel_source == "hotels":
         hotel_tools = [attach_call_fallback(item, "hotels_alt") for item in hotel_tools]
     if car_source == "cars":
@@ -763,6 +964,666 @@ class TripState(AgentState):
     genre: NotRequired[str]
 
 
+_DATE_PATTERNS = (
+    r"\b\d{4}-\d{2}-\d{2}\b",
+    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?\b",
+    r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|"
+    r"apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
+    r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{4})?\b",
+    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\s+\d{4}\b",
+)
+
+VENUE_UNAVAILABLE = (
+    "Source unavailable. Places and web search returned no venues. "
+    "No restaurants or bars are named."
+)
+
+_CREDIT_RE = re.compile(
+    r"(?:photo|image|photograph|photographer|credit|credits|byline|illustration)"
+    r"(?:\s+by|\s*:\s*|\s+)"
+    r"([A-Z][\w'’.-]+(?:\s+[A-Z][\w'’.-]+){0,3})",
+    re.I,
+)
+_PLACE_HINTS = {
+    "formattedAddress",
+    "formatted_address",
+    "rating",
+    "types",
+    "primaryType",
+    "googleMapsUri",
+    "priceLevel",
+    "nationalPhoneNumber",
+    "location",
+    "userRatingCount",
+    "regularOpeningHours",
+    "businessStatus",
+}
+_MEALS = ("breakfast", "brunch", "lunch", "dinner")
+_CUISINE_CONTRADICTION = r"shrimp|prawn|meat|fish|chicken|pork|beef|seafood|steak"
+
+
+def strip_trip_dates(text: str) -> str:
+    """Remove calendar dates from a places or Tavily query."""
+    cleaned = text
+    for pattern in _DATE_PATTERNS:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\b(?:on|for|during|dated)\s*$", "", cleaned, flags=re.I)
+    return cleaned.strip(" ,;-")
+
+
+def looks_like_venue_label(label: str) -> bool:
+    label = re.sub(r"\s+", " ", label).strip(" .-*#")
+    if not label or len(label) > 80:
+        return False
+    if re.search(r"\b(photo|credit|image|byline|photographer)\b", label, re.I):
+        return False
+    if re.search(r"\b(best|top|guide|essential|ultimate|review|where to)\b", label, re.I):
+        return False
+    words = label.split()
+    if not 1 <= len(words) <= 8:
+        return False
+    if re.search(r"\b(restaurants|bars|nightlife|hotels)\b", label, re.I) and len(words) > 3:
+        return False
+    if not (label[0].isupper() or label[0].isdigit()):
+        return False
+    return True
+
+
+def credit_names(text: str) -> set[str]:
+    return {match.group(1).strip() for match in _CREDIT_RE.finditer(text or "")}
+
+
+def _heading_names(text: str) -> list[str]:
+    scrubbed = "\n".join(
+        line
+        for line in (text or "").splitlines()
+        if not re.search(r"\b(photo|credit|byline|photographer)\b", line, re.I)
+    )
+    found: list[str] = []
+    found.extend(match.group(1).strip() for match in re.finditer(r"(?m)^#{1,3}\s+(.+)$", scrubbed))
+    found.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"(?m)^(?:[-*]|\d+[.)])\s+\*\*([^*]+)\*\*", scrubbed)
+    )
+    found.extend(
+        match.group(1).strip()
+        for match in re.finditer(
+            r"(?m)^(?:name|venue|restaurant|bar)\s*:\s*(.+)$", scrubbed, re.I
+        )
+    )
+    return found
+
+
+def _place_name(obj: dict[str, Any]) -> str | None:
+    if not any(key in obj for key in _PLACE_HINTS):
+        return None
+    display = obj.get("displayName") or obj.get("display_name")
+    if isinstance(display, dict):
+        display = display.get("text")
+    name = display or obj.get("name") or obj.get("title")
+    if not isinstance(name, str):
+        return None
+    if name.startswith("places/"):
+        return display.strip() if isinstance(display, str) else None
+    return name.strip()
+
+
+def _walk_place_names(node: Any) -> list[str]:
+    names: list[str] = []
+    if isinstance(node, dict):
+        place = _place_name(node)
+        if place:
+            names.append(place)
+        for key, value in node.items():
+            if key in {"content", "snippet", "raw_content"} and isinstance(value, str):
+                names.extend(_heading_names(value))
+            else:
+                names.extend(_walk_place_names(value))
+    elif isinstance(node, list):
+        for item in node:
+            names.extend(_walk_place_names(item))
+    return names
+
+
+def _venues_from_json(text: str) -> list[str]:
+    names: list[str] = []
+    candidates = [text]
+    if len(text) <= 20000:
+        candidates.extend(re.findall(r"(\{.*\}|\[.*\])", text, re.S)[:3])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        names.extend(_walk_place_names(parsed))
+    return names
+
+
+def extract_grounded_venues(text: str) -> set[str]:
+    """Places, plus Tavily headings that name a venue. Credits are not venues."""
+    if not text:
+        return set()
+    credits = {name.casefold() for name in credit_names(text)}
+    found = _venues_from_json(text) + _heading_names(text)
+    cleaned: set[str] = set()
+    for label in found:
+        label = re.sub(r"\s+", " ", label).strip(" *-")
+        if not looks_like_venue_label(label) or label.casefold() in credits:
+            continue
+        cleaned.add(label)
+    return cleaned
+
+
+def extract_listed_names(text: str) -> list[str]:
+    """Hotel or venue names from bold labels and list entries."""
+    names: list[str] = []
+    for match in re.finditer(r"\*\*([^*]{2,80})\*\*", text or ""):
+        names.append(match.group(1).strip())
+    for match in re.finditer(r"(?m)^(?:[-*]|\d+[.)])\s+([^:\n]{2,80})", text or ""):
+        raw = re.split(r"\s+[—–-]\s+", match.group(1).strip(), maxsplit=1)[0].strip()
+        names.append(raw)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if not looks_like_venue_label(name):
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(name)
+    return unique
+
+
+def _norm_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _name_allowed(name: str, allowed: set[str] | list[str]) -> bool:
+    norm = _norm_name(name)
+    for item in allowed:
+        other = _norm_name(item)
+        if not other:
+            continue
+        if norm == other or other in norm or (norm in other and len(norm) >= 8):
+            return True
+    return False
+
+
+_CLAIM_RES = (
+    re.compile(r"\*\*([^*]{2,80})\*\*"),
+    re.compile(r"(?m)^#{1,3}\s+(.{2,80})$"),
+    re.compile(r"(?m)^(?:[-*]|\d+[.)])\s+([^:\n—–-]{2,80})"),
+    re.compile(
+        r"\b(?:dinner|lunch|breakfast|brunch|drinks?|restaurant|bar)\s+at\s+([A-Z][^.,;\n]{2,60})",
+        re.I,
+    ),
+)
+
+
+def _claim_names(line: str) -> list[str]:
+    found: list[str] = []
+    for pattern in _CLAIM_RES:
+        found.extend(match.group(1).strip(" .") for match in pattern.finditer(line))
+    return [name for name in found if looks_like_venue_label(name)]
+
+
+def drop_ungrounded_claims(
+    text: str,
+    allowed: set[str],
+    keep: list[str] | None = None,
+) -> str:
+    """Drop lines that name a venue the tool output did not return."""
+    kept: list[str] = []
+    safe = keep or []
+    for line in text.splitlines():
+        claims = _claim_names(line)
+        if any(not _name_allowed(claim, allowed) and not _name_allowed(claim, safe) for claim in claims):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def parse_venues_line(text: str) -> set[str] | None:
+    match = re.search(r"(?m)^VENUES:\s*(.*)$", text or "")
+    if not match:
+        return None
+    body = match.group(1).strip()
+    if body.lower() in {"(none)", "none", ""}:
+        return set()
+    return {part.strip() for part in body.split("|") if part.strip() and part.strip().lower() != "(none)"}
+
+
+def evidence_confirms_hours(evidence: str) -> bool:
+    """A tool states hours for a date, not a generic open/closed guess."""
+    if not evidence:
+        return False
+    has_date = bool(
+        re.search(
+            r"\b\d{4}-\d{2}-\d{2}\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b",
+            evidence,
+            re.I,
+        )
+    )
+    states_hours = bool(re.search(r"\b(open|hours)\b", evidence, re.I))
+    explicit = bool(re.search(r"\b(confirmed open|hours confirmed|open on)\b", evidence, re.I))
+    return bool(has_date and states_hours and explicit)
+
+
+def scrub_unconfirmed_hours(answer: str, evidence: str) -> str:
+    if evidence_confirms_hours(evidence):
+        return answer
+    sentences = re.split(r"(?<=[.!\n])\s+", answer)
+    rewritten: list[str] = []
+    for sentence in sentences:
+        if re.search(r"\bconfirmed\b", sentence, re.I) and re.search(r"\b(?:hours?|open)\b", sentence, re.I):
+            rewritten.append("Check hours before going.")
+        else:
+            rewritten.append(sentence)
+    return " ".join(part for part in rewritten if part).strip()
+
+
+def _evidence_window(evidence: str, venue: str, radius: int = 400) -> str:
+    index = evidence.casefold().find(venue.casefold())
+    if index < 0:
+        return evidence
+    return evidence[max(0, index - radius) : index + len(venue) + radius]
+
+
+def scrub_overclaims(answer: str, evidence: str, venues: set[str]) -> str:
+    """Don't relabel cuisine or move a place to a meal the source did not state."""
+    if not answer or not venues:
+        return answer
+    lines: list[str] = []
+    for line in answer.splitlines():
+        updated = line
+        for venue in venues:
+            if venue.casefold() not in updated.casefold():
+                continue
+            window = _evidence_window(evidence, venue)
+            if re.search(r"\bvegetarian\b", updated, re.I) and re.search(
+                _CUISINE_CONTRADICTION, window, re.I
+            ) and not re.search(r"\bvegetarian\b", window, re.I):
+                updated = re.sub(r"\bvegetarian\b", "the source's menu", updated, flags=re.I)
+                updated += " Cuisine was not relabeled beyond the source."
+            for meal in _MEALS:
+                if not re.search(rf"\b{meal}\b", updated, re.I):
+                    continue
+                if re.search(rf"\b{meal}\b", window, re.I):
+                    continue
+                supported = [item for item in _MEALS if re.search(rf"\b{item}\b", window, re.I)]
+                if supported:
+                    updated = re.sub(rf"\b{meal}\b", supported[0], updated, count=1, flags=re.I)
+                    updated += f" The source says {supported[0]}, not {meal}."
+        lines.append(updated)
+    return "\n".join(lines)
+
+
+def render_grounded_specialist(prose: str, allowed: set[str], evidence: str, tools_called: bool) -> str:
+    """Restaurant and bar answers may name only venues a tool returned."""
+    if not tools_called:
+        return prose.rstrip() + "\nVENUES: (none)"
+    prose = scrub_unconfirmed_hours(prose, evidence)
+    prose = scrub_overclaims(prose, evidence, allowed)
+    if not allowed:
+        return VENUE_UNAVAILABLE + "\nVENUES: (none)"
+    prose = drop_ungrounded_claims(prose, allowed)
+    if not prose.strip():
+        prose = "No grounded venues to recommend."
+    listed = " | ".join(sorted(allowed, key=str.lower))
+    return prose.strip() + f"\nVENUES: {listed}"
+
+
+def ensure_hotels_kept(answer: str, names: list[str]) -> str:
+    """Keep every hotel the specialist returned unless the answer explains the omission."""
+    missing: list[str] = []
+    reason = re.compile(
+        r"\b(because|excluded|omitted|dropped|left out|not included|too far|sold out|unavailable|skip)\b",
+        re.I,
+    )
+    for name in names:
+        if name.casefold() in answer.casefold():
+            continue
+        token = name.split()[0]
+        explained = any(
+            token.casefold() in sentence.casefold() and reason.search(sentence)
+            for sentence in re.split(r"(?<=[.!\n])\s+", answer)
+        )
+        if not explained:
+            missing.append(name)
+    if not missing:
+        return answer
+    extra = "\n".join(f"- {name}" for name in missing)
+    return answer.rstrip() + "\n\nHotels returned by the hotel specialist (kept):\n" + extra
+
+
+def _parse_date(value: Any) -> date | None:
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(value or ""))
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def _looks_like_itinerary(node: dict[str, Any]) -> bool:
+    has_price = any(key in node for key in ("price", "priceEur", "fare"))
+    has_link = any(
+        key in node
+        for key in ("bookingUrl", "booking_url", "deep_link", "deepLink", "bookingLink")
+    )
+    has_legs = any(key in node for key in ("route", "legs", "segments", "outbound"))
+    return has_price and (has_link or has_legs)
+
+
+def _walk_itineraries(node: Any) -> list[dict[str, Any]]:
+    if isinstance(node, list):
+        found: list[dict[str, Any]] = []
+        for item in node:
+            found.extend(_walk_itineraries(item))
+        return found
+    if isinstance(node, dict):
+        if _looks_like_itinerary(node):
+            return [node]
+        found = []
+        for key in ("itineraries", "data", "results", "flights"):
+            if key in node:
+                found.extend(_walk_itineraries(node[key]))
+        if found:
+            return found
+        for value in node.values():
+            if isinstance(value, (list, dict)):
+                found.extend(_walk_itineraries(value))
+        return found
+    if isinstance(node, str):
+        try:
+            return _walk_itineraries(json.loads(node))
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _itinerary_price(node: dict[str, Any]) -> tuple[str, str]:
+    price = node.get("price", node.get("priceEur", node.get("fare")))
+    currency = str(node.get("currency") or node.get("currencyCode") or "")
+    if isinstance(price, dict):
+        currency = str(price.get("currency") or currency)
+        price = price.get("amount") or price.get("value")
+    return str(price), currency
+
+
+def _itinerary_link(node: dict[str, Any]) -> str:
+    for key in ("bookingUrl", "booking_url", "bookingLink", "deep_link", "deepLink", "bookUrl"):
+        if node.get(key):
+            return str(node[key])
+    return ""
+
+
+def _itinerary_legs(node: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("route", "legs", "segments"):
+        if isinstance(node.get(key), list):
+            return [leg for leg in node[key] if isinstance(leg, dict)]
+    legs: list[dict[str, Any]] = []
+    for key in ("outbound", "return", "inbound"):
+        part = node.get(key)
+        if isinstance(part, list):
+            legs.extend(leg for leg in part if isinstance(leg, dict))
+        elif isinstance(part, dict):
+            legs.append(part)
+    return legs
+
+
+def _leg_line(leg: dict[str, Any]) -> str:
+    origin = leg.get("flyFrom") or leg.get("from") or leg.get("origin") or "?"
+    destination = leg.get("flyTo") or leg.get("to") or leg.get("destination") or "?"
+    depart = leg.get("local_departure") or leg.get("departure") or ""
+    arrive = leg.get("local_arrival") or leg.get("arrival") or ""
+    return f"{origin} -> {destination} depart {depart} arrive {arrive}".strip()
+
+
+def _first_arrival(item: dict[str, Any]) -> date | None:
+    legs = _itinerary_legs(item)
+    if not legs:
+        return None
+    return _parse_date(legs[0].get("local_arrival") or legs[0].get("arrival"))
+
+
+def travel_eaten_warning(items: list[dict[str, Any]], args: dict[str, Any]) -> str | None:
+    start = _parse_date(args.get("departureDate") or args.get("departure_date") or args.get("date_from"))
+    end = _parse_date(args.get("returnDate") or args.get("return_date") or args.get("date_to"))
+    notes: list[str] = []
+    for item in items:
+        arrival = _first_arrival(item)
+        if start and arrival and arrival >= start + timedelta(days=1):
+            notes.append(
+                f"Arrival {arrival.isoformat()} is a day or more after the trip start "
+                f"{start.isoformat()}. Travel eats into the trip."
+            )
+            break
+    if start and end:
+        span = (end - start).days
+        for item in items:
+            arrival = _first_arrival(item)
+            if arrival is None:
+                continue
+            ground = (end - arrival).days
+            if span >= 2 and ground * 2 < span:
+                notes.append("The trip is mostly eaten by travel.")
+                break
+    if not notes:
+        return None
+    return " ".join(dict.fromkeys(notes))
+
+
+def render_kiwi_itineraries(payload: Any, args: dict[str, Any] | None = None) -> str:
+    """One block per Kiwi result so price, legs, and booking link stay together."""
+    args = args or {}
+    items = _walk_itineraries(payload)
+    if not items:
+        return payload if isinstance(payload, str) else json.dumps(payload, default=str)
+    blocks: list[str] = []
+    for index, item in enumerate(items, 1):
+        price, currency = _itinerary_price(item)
+        link = _itinerary_link(item)
+        legs = "\n".join(f"  - {_leg_line(leg)}" for leg in _itinerary_legs(item)) or "  - (no legs)"
+        blocks.append(
+            f"ITINERARY {index}\n"
+            f"price: {price} {currency}".rstrip()
+            + "\n"
+            + f"booking_link: {link}\n"
+            + f"legs:\n{legs}\n"
+            + "These price, legs, and booking_link values are one Kiwi result. "
+            + "Do not combine them with another itinerary."
+        )
+    text = (
+        "Each block is one Kiwi itinerary. Keep its price, legs, and booking link together.\n\n"
+        + "\n\n".join(blocks)
+    )
+    warning = travel_eaten_warning(items, args)
+    if warning:
+        text += f"\n\nWARNING: {warning}"
+    return text
+
+
+def _coerce_payload(content: Any) -> Any:
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("text"):
+                texts.append(str(block["text"]))
+            elif isinstance(block, str):
+                texts.append(block)
+        joined = "\n".join(texts)
+        try:
+            return json.loads(joined)
+        except json.JSONDecodeError:
+            return joined
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return content
+    return content
+
+
+def _flight_call_args(messages: list[Any]) -> dict[str, Any]:
+    for message in messages:
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls or []:
+                if "flight" in str(call.get("name") or ""):
+                    args = call.get("args") or {}
+                    return args if isinstance(args, dict) else {}
+    return {}
+
+
+def flight_specialist_text(result: dict[str, Any]) -> str | None:
+    """Return locked Kiwi blocks when the flight tools returned itineraries."""
+    messages = result.get("messages") or []
+    blobs = [
+        _message_text(message.content)
+        for message in messages
+        if isinstance(message, ToolMessage)
+    ]
+    if not blobs:
+        return None
+    rendered = render_kiwi_itineraries(_coerce_payload("\n".join(blobs)), _flight_call_args(messages))
+    if "ITINERARY" not in rendered:
+        return None
+    return rendered
+
+
+def repair_flight_pairing(answer: str, flight_text: str) -> str:
+    """Replace a summary that pairs one itinerary's price with another's link."""
+    if "ITINERARY" not in (flight_text or ""):
+        return answer
+    blocks: list[tuple[str, str]] = []
+    for chunk in re.split(r"\n(?=ITINERARY \d+)", flight_text):
+        price_match = re.search(r"(?m)^price:\s*([0-9]+(?:\.[0-9]+)?)", chunk)
+        link_match = re.search(r"(?m)^booking_link:\s*(\S+)", chunk)
+        if price_match and link_match:
+            blocks.append((price_match.group(1), link_match.group(1)))
+    if len(blocks) < 2:
+        return answer
+    for price, link in blocks:
+        if link not in answer:
+            continue
+        index = answer.find(link)
+        window = answer[max(0, index - 160) : index + len(link) + 160]
+        for other_price, _other_link in blocks:
+            if other_price == price:
+                continue
+            if re.search(rf"\b{re.escape(other_price)}\b", window):
+                return (
+                    answer.rstrip()
+                    + "\n\nFlight fields were mixed across Kiwi results. "
+                    + "Use these itineraries intact:\n\n"
+                    + flight_text
+                )
+    return answer
+
+
+def _tool_blob(messages: list[Any], name: str) -> str:
+    parts = [
+        _message_text(message.content)
+        for message in messages
+        if isinstance(message, ToolMessage) and getattr(message, "name", None) == name
+    ]
+    return "\n".join(parts)
+
+
+def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
+    """Drop ungrounded venues, unconfirmed hours, mixed flight fields, and lost hotels."""
+    restaurants = _tool_blob(messages, "suggest_restaurants")
+    bars = _tool_blob(messages, "suggest_bars")
+    hotels = _tool_blob(messages, "search_hotels")
+    flights = _tool_blob(messages, "search_flights")
+    allowed: set[str] = set()
+    explicit_none = False
+    dining_called = bool(restaurants.strip() or bars.strip())
+    for blob in (restaurants, bars):
+        parsed = parse_venues_line(blob)
+        if parsed is None:
+            allowed |= extract_grounded_venues(blob)
+        else:
+            if not parsed:
+                explicit_none = True
+            allowed |= parsed
+    hotel_names = extract_listed_names(hotels)
+    before = answer
+    if dining_called:
+        answer = drop_ungrounded_claims(answer, allowed, hotel_names)
+        dropped = answer != before
+        answer = scrub_unconfirmed_hours(answer, restaurants + "\n" + bars)
+        answer = scrub_overclaims(answer, restaurants + "\n" + bars, allowed)
+        if dropped and (explicit_none or not allowed) and "unavailable" not in answer.lower():
+            answer = answer.rstrip() + "\n\n" + VENUE_UNAVAILABLE
+    answer = ensure_hotels_kept(answer, hotel_names)
+    answer = repair_flight_pairing(answer, flights)
+    return answer
+
+
+def coordinator_postcheck(state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
+    messages = list(state.get("messages") or [])
+    if not messages:
+        return None
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or last.tool_calls or not last.content:
+        return None
+    text = _message_text(last.content)
+    updated = apply_coordinator_checks(text, messages)
+    if updated == text:
+        return None
+    if last.id is None:
+        last.id = str(uuid.uuid4())
+    return {"messages": [last.model_copy(update={"content": updated})]}
+
+
+coordinator_postcheck_middleware = after_model(coordinator_postcheck)
+
+
+def attach_flight_binding(tool: BaseTool) -> BaseTool:
+    """Replace a Kiwi flight payload with one locked block per itinerary."""
+    if "flight" not in tool.name or tool.coroutine is None:
+        return tool
+    original = tool.coroutine
+
+    async def wrapped(**kwargs: Any) -> Any:
+        value = await original(**kwargs)
+        content, artifact = value if isinstance(value, tuple) and len(value) == 2 else (value, None)
+        rendered = render_kiwi_itineraries(_coerce_payload(content), kwargs)
+        if getattr(tool, "response_format", "content") == "content_and_artifact":
+            return (rendered, artifact)
+        return rendered
+
+    tool.coroutine = wrapped
+    return tool
+
+
+def attach_date_strip(tool: BaseTool) -> BaseTool:
+    """Places queries should not carry the trip dates."""
+    if tool.coroutine is None or getattr(tool, "_trip_dates_stripped", False):
+        return tool
+    original = tool.coroutine
+
+    async def wrapped(**kwargs: Any) -> Any:
+        cleaned = {
+            key: strip_trip_dates(value) if isinstance(value, str) else value
+            for key, value in kwargs.items()
+        }
+        return await original(**cleaned)
+
+    tool.coroutine = wrapped
+    setattr(tool, "_trip_dates_stripped", True)
+    return tool
+
+
 async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
     try:
         specialists = await get_specialists()
@@ -779,6 +1640,21 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
             {"messages": [HumanMessage(content=message)]},
             config={"recursion_limit": 40},
         )
+        if key == "flight":
+            locked = flight_specialist_text(result)
+            if locked:
+                return locked
+        if key in {"restaurant", "bar"}:
+            messages = result.get("messages") or []
+            tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+            evidence = "\n".join(_message_text(item.content) for item in tool_messages)
+            allowed = extract_grounded_venues(evidence)
+            return render_grounded_specialist(
+                final_text(result),
+                allowed,
+                evidence,
+                tools_called=bool(tool_messages),
+            )
         return final_text(result)
     except Exception as exc:
         return f"{key} specialist failed: {exc}"
@@ -786,7 +1662,7 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
 
 @tool
 async def search_flights(request: str, runtime: ToolRuntime) -> str:
-    """Ask the flight specialist for one-way economy options. Pass origin, destination, and dates in request."""
+    """Ask the flight specialist for economy options. Pass origin, destination, and dates. Include a return date when the trip has one."""
     return await _delegate("flight", request, runtime)
 
 
@@ -854,8 +1730,12 @@ COORDINATOR_TOOLS = [
 COORDINATOR_PROMPT = """
 You are a trip planner coordinator.
 First find origin, destination, guest count, and the kind of trip (genre). When you have them, call update_state by itself and wait for it to return.
-Then delegate, one specialist at a time, using search_flights, search_hotels, suggest_rental_cars, suggest_restaurants, and suggest_bars. Pass each specialist a self-contained request with dates, party size, and preferences from the conversation.
-Use web_search only for gaps the specialists do not cover: events, attractions, travel advisories, and opening hours. Do not invent prices.
+Then delegate with search_flights, search_hotels, suggest_rental_cars, suggest_restaurants, and suggest_bars. Independent specialists may be called in parallel; that is faster than waiting for one before the next. Pass each specialist a self-contained request with dates, party size, and preferences from the conversation.
+Use web_search only for gaps the specialists do not cover: events, attractions, travel advisories, and opening hours. Do not put trip dates into web search queries. Do not invent prices, venues, ratings, or hours.
+Keep every hotel the hotel specialist returned. Drop one only when you explain why.
+Name a restaurant or bar only when that specialist's tool output names it as a place. Drop photo credits, bylines, and any other name that is not a returned venue. When a specialist says the source is unavailable, repeat that and name no venues.
+Do not say hours or open status are confirmed for the trip dates unless a tool result states it. Otherwise say check hours before going. Do not relabel cuisine or move a place to a meal the source did not support.
+For flights, keep each itinerary's price, legs, and booking link together. Repeat a warning that arrival is late or that travel eats the trip.
 When the specialists have answered, combine their facts into one itinerary. Name any source that was unavailable. You plan and compare; you do not book.
 """.strip()
 
@@ -920,6 +1800,7 @@ def build_graph():
         tools=COORDINATOR_TOOLS,
         system_prompt=COORDINATOR_PROMPT,
         state_schema=TripState,
+        middleware=[coordinator_postcheck_middleware],
         name="trip_planner",
     )
 
