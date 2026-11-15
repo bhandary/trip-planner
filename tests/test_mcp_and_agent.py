@@ -1356,6 +1356,8 @@ async def test_graph_renders_cars_and_hotels_from_tool_payloads(monkeypatch):
     assert "Inn Rossio Hotel" in text
     assert "Hotel ibis Lisboa Jose Malhoa" in text
     assert "Hotels in Lisbon (2027-03-15 to 2027-03-18):" in text
+    assert "€67 per night" in text and "€231 total" in text
+    assert "€47 per night" in text and "€174 total" in text
     assert "Hotels returned by the hotel specialist" not in text
     for label in ("Cancellation policy", "Booking link", "Neighborhood", "Nightly rate"):
         assert label not in text
@@ -1420,3 +1422,234 @@ def test_pub_crawl_is_dropped_from_bar_picks():
     assert "Park Bar" in text
     assert not agent.is_bar_venue("The Lisbon Pub Crawl")
     assert agent.is_bar_venue("Park Bar")
+
+
+def test_hotel_stash_renders_nightly_and_total_when_the_tool_message_does_not():
+    table = """
+| Hotel | Price/night | Total | Booking |
+| --- | --- | --- | --- |
+| **The Lisbon Inn** | $52 | $157 | [View deal](https://skiplagged.com/hotel/1) |
+| **Alfama Stay** | $88 | $263 | [View deal](https://skiplagged.com/hotel/2) |
+| **River House** | $75 | $224 | [View deal](https://skiplagged.com/hotel/3) |
+| **Bairro Alto Rooms** | $96 | $290 | [View deal](https://skiplagged.com/hotel/4) |
+| **Chiado Hotel** | $106 | $319 | [View deal](https://skiplagged.com/hotel/5) |
+"""
+    agent.clear_capture()
+    try:
+        agent.seal_hotel_tool_result(
+            table, {"city": "Lisbon", "checkin": "2027-03-12", "checkout": "2027-03-15"}
+        )
+        text = agent.apply_coordinator_checks(
+            "Hotels\nThe Lisbon Inn, Alfama Stay, River House, Bairro Alto Rooms, and Chiado Hotel.",
+            [
+                ToolMessage(
+                    "Skiplagged rows were not copied onto this tool message.",
+                    name="search_hotels",
+                    tool_call_id="hotels",
+                )
+            ],
+        )
+    finally:
+        agent.clear_capture()
+    assert "Hotels in Lisbon (2027-03-12 to 2027-03-15):" in text
+    for total in ("$157", "$263", "$224", "$290", "$319"):
+        assert total in text
+    assert "$52 per night" in text
+    assert "$106 per night" in text
+    assert "https://skiplagged.com/hotel/1" in text
+
+
+def _one_way_itinerary(origin, dest, day, price, link):
+    return {
+        "price": price,
+        "currency": "EUR",
+        "bookingUrl": link,
+        "outbound": {
+            "from": origin,
+            "to": dest,
+            "departureTime": f"{day}T08:00:00",
+            "arrivalTime": f"{day}T16:00:00",
+            "segments": [
+                {
+                    "from": origin,
+                    "to": dest,
+                    "departureTime": f"{day}T08:00:00",
+                    "arrivalTime": f"{day}T16:00:00",
+                    "carrierName": "TAP",
+                    "flightNumber": "TP123",
+                }
+            ],
+        },
+    }
+
+
+def _scripted_flight_model(script):
+    class ScriptedFlightModel(agent.FakeTripModel):
+        def _respond(self, messages):
+            system = agent._system_text(messages)
+            names = agent._tool_names(self.bound_tools)
+            user = agent._human_text(messages)
+            coordinator = "trip planner coordinator" in system or (
+                "update_state" in names and "search_flights" in names
+            )
+            if coordinator:
+                called = agent._called_tools(messages)
+                if "update_state" in names and "update_state" not in called:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "update_state",
+                                "args": {
+                                    "origin": "SFO",
+                                    "destination": "Lisbon",
+                                    "guest_count": "2",
+                                    "genre": "city break",
+                                },
+                                "id": "call_update_state",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                if "search_flights" in names and "search_flights" not in called:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "search_flights",
+                                "args": {"request": user},
+                                "id": "call_search_flights",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                return AIMessage(
+                    content="Flights\nthere is no return flight on your specified date\n"
+                )
+            if "travel agent" in system:
+                done = sum(
+                    1
+                    for message in messages
+                    if isinstance(message, ToolMessage) and getattr(message, "name", "") == "search-flight"
+                )
+                if done < len(script):
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "search-flight",
+                                "args": script[done],
+                                "id": f"call_flight_{done}",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                return AIMessage(content="No fare listed.")
+            return AIMessage(content="Offline specialist.")
+
+    return ScriptedFlightModel
+
+
+async def _run_scripted_flights(monkeypatch, script, search):
+    from langchain_core.tools import StructuredTool
+
+    monkeypatch.setenv("TRIP_PLANNER_FAKE_LLM", "1")
+    agent.clear_mcp_cache()
+
+    async def fake_list(name):
+        if name == "kiwi":
+            return [
+                StructuredTool.from_function(
+                    coroutine=search, name="search-flight", description="Kiwi flights"
+                )
+            ]
+        raise ConnectionError(name)
+
+    monkeypatch.setattr(agent, "list_server_tools", fake_list)
+    monkeypatch.setattr(agent, "FakeTripModel", _scripted_flight_model(script))
+    try:
+        planner = agent.build_graph()
+        final = await planner.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Plan 3 days in Lisbon from SFO for 2 people, "
+                            "outbound 12 March 2027 and return 15 March 2027."
+                        ),
+                    }
+                ]
+            },
+            config={"recursion_limit": 40},
+        )
+    finally:
+        agent.clear_mcp_cache()
+    return agent.final_text(final)
+
+
+@pytest.mark.asyncio
+async def test_two_one_way_searches_become_the_12_to_15_itinerary(monkeypatch):
+    async def search_flight(flyFrom: str = "", flyTo: str = "", departureDate: str = "", returnDate: str = ""):
+        if flyFrom.upper() == "LIS":
+            return {
+                "currency": "EUR",
+                "itineraries": [
+                    _one_way_itinerary("LIS", "SFO", "2027-03-15", 1001.0, "https://kiwi.com/u/9bs2n3s")
+                ],
+            }
+        return {
+            "currency": "EUR",
+            "itineraries": [
+                _one_way_itinerary("SFO", "LIS", "2027-03-12", price, f"https://kiwi.com/u/out{price}")
+                for price in (400, 500, 600, 900)
+            ],
+        }
+
+    text = await _run_scripted_flights(
+        monkeypatch,
+        [
+            {"flyFrom": "SFO", "flyTo": "LIS", "departureDate": "2027-03-12"},
+            {"flyFrom": "LIS", "flyTo": "SFO", "departureDate": "2027-03-15"},
+        ],
+        search_flight,
+    )
+    assert "Flights (2027-03-12 to 2027-03-15):" in text
+    assert "1001.0 EUR" in text
+    assert "https://kiwi.com/u/9bs2n3s" in text
+    assert "SFO -> LIS depart 2027-03-12T08:00:00" in text
+    assert "LIS -> SFO depart 2027-03-15T08:00:00" in text
+    assert "https://kiwi.com/u/out400" in text
+    assert "https://kiwi.com/u/out500" in text
+    assert "https://kiwi.com/u/out600" in text
+    assert "https://kiwi.com/u/out900" not in text
+    assert "no return flight" not in text.lower()
+    assert "ALTERNATE DATES" not in text
+
+
+@pytest.mark.asyncio
+async def test_missing_return_date_is_filled_and_rendered(monkeypatch):
+    seen = []
+
+    async def search_flight(flyFrom: str = "", flyTo: str = "", departureDate: str = "", returnDate: str = ""):
+        seen.append({"flyFrom": flyFrom, "flyTo": flyTo, "departureDate": departureDate, "returnDate": returnDate})
+        if agent._parse_date(returnDate) and agent._parse_date(returnDate).isoformat() == "2027-03-15":
+            item = _kiwi_itinerary(1249, "https://kiwi.com/u/tap1249", "2027-03-12", "2027-03-15")
+            for segment in item["outbound"]["segments"]:
+                segment["carrierName"] = "TAP"
+            return {"currency": "EUR", "itineraries": [item]}
+        return {"itineraries": []}
+
+    text = await _run_scripted_flights(
+        monkeypatch,
+        [{"flyFrom": "SFO", "flyTo": "LIS", "departureDate": "2027-03-12"}],
+        search_flight,
+    )
+    assert seen and agent._parse_date(seen[0]["returnDate"]).isoformat() == "2027-03-15"
+    assert "Flights (2027-03-12 to 2027-03-15):" in text
+    assert "1249 EUR" in text
+    assert "https://kiwi.com/u/tap1249" in text
+    assert "TAP" in text
+    assert "SFO -> YUL depart 2027-03-12T08:25:00" in text
+    assert "LIS -> SFO depart 2027-03-15T12:15:00" in text
+    assert "no return flight" not in text.lower()
