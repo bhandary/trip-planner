@@ -2249,7 +2249,7 @@ def stash_flight_search(search: dict[str, Any]) -> None:
 
 NO_FLIGHTS_FOUND = "No flights found for these dates."
 FLIGHT_SOURCE_UNAVAILABLE = "The flight source is unavailable."
-_FLIGHT_OUTAGE = re.compile(r"unavailable|time-?d?\s*out|rate[\s-]*limit|upstream", re.I)
+_FLIGHT_OUTAGE = re.compile(r"unavailable|time-?d?\s*out|rate[\s-]*limit", re.I)
 
 
 def _flight_payload_is_outage(data: dict[str, Any]) -> bool:
@@ -2325,10 +2325,13 @@ def render_flight_section(record: dict[str, Any]) -> str:
         if not isinstance(item, dict):
             continue
         currency = item.get("currency") or "EUR"
-        if item.get("return_price"):
-            fare = f"{item.get('price') or ''} {currency} + {item.get('return_price')} {currency}".strip()
+        raw_price = item.get("price")
+        if raw_price is None or str(raw_price).strip() == "":
+            fare = "price unavailable"
+        elif item.get("return_price"):
+            fare = f"{raw_price} {currency} + {item.get('return_price')} {currency}".strip()
         else:
-            fare = f"{item.get('price') or ''} {currency}".strip()
+            fare = f"{raw_price} {currency}".strip()
         links = [str(item.get("booking_url") or ""), str(item.get("return_url") or "")]
         lines.append("- " + " | ".join([fare, *[link for link in links if link]]))
         for leg in item.get("legs") or []:
@@ -3060,12 +3063,26 @@ def _label_only_line(line: str) -> bool:
     return bool(cleaned) and cleaned in HOTEL_FIELD_LABELS
 
 
-def _skippable_section_line(kind: str, line: str) -> bool:
-    """Lines that belong to the coordinator's old cars or hotels block."""
+_FARE_FIELD_BULLET = re.compile(
+    r"^[-*•]\s*(?:\*\*)?(?:fare|price|nightly rate|price/night)(?:\*\*)?\s*:",
+    re.I,
+)
+
+
+def _bold_wrapped_text(line: str) -> str | None:
+    wrapped = re.fullmatch(r"\*\*(.+)\*\*", line.strip())
+    return wrapped.group(1).strip() if wrapped else None
+
+
+def _skippable_section_line(kind: str, line: str, *, after_blank: bool = False) -> bool:
+    """Lines that belong to the coordinator's old cars, hotels, or flights block.
+
+    Blank lines stay inside the block. After a blank line, a flights block only
+    continues through leftover offers, and stops at the first real tip.
+    """
     stripped = line.strip()
     if not stripped:
-        # A blank line ends the hotels or flights list. Later bullets are a new list.
-        return kind not in {"flights", "hotels"}
+        return True
     if _section_kind(line):
         return False
     if _label_only_line(line):
@@ -3076,18 +3093,32 @@ def _skippable_section_line(kind: str, line: str) -> bool:
         or re.fullmatch(r"[\s():]*", stripped)
     ):
         return True
-    if kind == "hotels" and (stripped.startswith(("-", "*", "•")) or stripped.startswith("**")):
-        return True
+    if kind == "hotels":
+        # A bold sentence is prose (``**Hotel check-in is at 3 PM.**``). A bold
+        # name is the old hotel list, including when a blank line separates blocks.
+        if stripped.startswith("**"):
+            inner = _bold_wrapped_text(stripped)
+            return not _is_prose_sentence(inner if inner is not None else stripped.strip("*"))
+        return stripped.startswith(("-", "*", "•"))
     if kind == "flights":
-        # Day plans and labelled alternates stay. Other bullets and leftover fares
-        # belong to the old list, and only until the first blank line.
         if re.match(r"[-*•]\s*day\s+\d+\b", stripped, re.I):
             return False
         if _labelled_alternate_flight(line):
             return False
+        if after_blank:
+            return _stale_flight_continuation(line)
+        if stripped.startswith("**"):
+            inner = _bold_wrapped_text(stripped)
+            if inner is not None and not _is_prose_sentence(inner):
+                return True
         if stripped.startswith(("-", "*", "•")) or _stale_flight_offer_line(line):
             return True
     return False
+
+
+def _collapse_blank_lines(text: str) -> str:
+    """A skip can leave the gap on both sides of a removed block."""
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def replace_named_section(answer: str, kind: str, new_section: str) -> str:
@@ -3095,6 +3126,7 @@ def replace_named_section(answer: str, kind: str, new_section: str) -> str:
     lines = (answer or "").splitlines()
     out: list[str] = []
     skipping = False
+    after_blank = False
     inserted = False
     for line in lines:
         if _section_kind(line) == kind:
@@ -3102,14 +3134,18 @@ def replace_named_section(answer: str, kind: str, new_section: str) -> str:
                 out.extend(new_section.splitlines())
                 inserted = True
             skipping = True
+            after_blank = False
             continue
-        if skipping and _skippable_section_line(kind, line):
+        if skipping and _skippable_section_line(kind, line, after_blank=after_blank):
+            if not line.strip():
+                after_blank = True
             continue
         skipping = False
+        after_blank = False
         out.append(line)
-    text = "\n".join(out).strip()
+    text = _collapse_blank_lines("\n".join(out))
     if not inserted:
-        text = (text + "\n\n" + new_section).strip()
+        text = _collapse_blank_lines(text + "\n\n" + new_section)
     return text
 
 
@@ -3512,6 +3548,18 @@ def _stale_flight_offer_line(line: str) -> bool:
     if re.search(r"kiwi\.com", line, re.I):
         return True
     return bool(_FLIGHT_PRICE.search(line) and re.search(r"\b[A-Z]{1,3}\d{2,4}\b", line))
+
+
+def _stale_flight_continuation(line: str) -> bool:
+    """A leftover offer that continues past a blank line. A tip is not one of these."""
+    if _labelled_alternate_flight(line) or re.match(r"[-*•]\s*day\s+\d+\b", line.strip(), re.I):
+        return False
+    inner = _bold_wrapped_text(line)
+    if inner is not None and not _is_prose_sentence(inner):
+        return True
+    if _stale_flight_offer_line(line):
+        return True
+    return bool(_FARE_FIELD_BULLET.match(line.strip()))
 
 
 def _replace_empty_flight_section(answer: str) -> str:

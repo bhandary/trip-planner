@@ -2632,3 +2632,125 @@ def test_bold_checkin_after_hotel_list_survives_the_blank_line():
     assert "Old Capitol Hotel" not in text
     assert "**Hotel check-in is at 3 PM.**" in text
     assert "Memmo Alfama" in text
+
+
+def test_bold_hotel_blocks_separated_by_blanks_are_not_repeated():
+    record = {
+        "city": "Lisbon",
+        "checkin": "2027-03-15",
+        "checkout": "2027-03-18",
+        "hotels": [
+            {
+                "name": "Memmo Alfama",
+                "nightly": "€200",
+                "total": "€600",
+                "link": "https://skiplagged.com/hotel/memmo",
+            },
+            {
+                "name": "Inn Rossio Hotel",
+                "nightly": "€67",
+                "total": "€231",
+                "link": "https://skiplagged.com/hotel/rossio",
+            },
+        ],
+    }
+    rendered = agent.render_hotel_section(record)
+    text = agent.apply_coordinator_checks(
+        "### Hotels in Lisbon\n"
+        "\n"
+        "**Memmo Alfama**\n"
+        "- Nightly rate: 150 EUR\n"
+        "\n"
+        "**Inn Rossio Hotel**\n"
+        "- Nightly rate: 67 EUR\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("HOTELS", record),
+                name="search_hotels",
+                tool_call_id="hotels",
+            )
+        ],
+    )
+    assert text.count("Memmo Alfama") == 1
+    assert text.count("Inn Rossio Hotel") == 1
+    assert "Nightly rate:" not in text
+    assert rendered.splitlines()[0] in text
+
+
+def test_stale_flight_block_after_a_blank_is_dropped_and_tips_stay():
+    flights = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [_tap_round_trip(320, "https://kiwi.com/default-sort")],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    rendered = agent.render_flight_section(flights)
+    text = agent.apply_coordinator_checks(
+        "Flights:\n"
+        "- old TP238 line\n"
+        "\n"
+        "**Option 2: Delta DL100**\n"
+        "- Fare: 380 EUR\n"
+        "\n"
+        "- Bring a passport valid 6 months\n"
+        "- Lisbon airport metro is 1.80 EUR\n"
+        "Enjoy.\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("FLIGHTS", flights),
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ],
+    )
+    assert "old TP238 line" not in text
+    assert "Option 2: Delta DL100" not in text
+    assert "Fare: 380 EUR" not in text
+    assert "- Bring a passport valid 6 months" in text
+    assert "- Lisbon airport metro is 1.80 EUR" in text
+    assert "Enjoy." in text
+
+
+def test_upstream_in_a_no_results_message_is_not_an_outage():
+    text = agent.render_kiwi_itineraries(
+        {"itineraries": [], "message": "No flights found; upstream returned 0 rows"}
+    )
+    assert text == "No flights found for these dates."
+    assert text != "The flight source is unavailable."
+
+
+def test_skipped_section_does_not_leave_a_double_blank():
+    text = agent.replace_named_section(
+        "Intro.\n\n\nFlights:\n- old listing\n\n\nEnjoy the city.\n",
+        "flights",
+        "Flights (2027-03-15 to 2027-03-18):\n- 320 EUR | https://kiwi.com/x",
+    )
+    assert "\n\n\n" not in text
+    assert "Enjoy the city." in text
+    assert "old listing" not in text
+    assert "Flights (2027-03-15 to 2027-03-18):" in text
+
+
+def test_blank_fare_renders_price_unavailable():
+    text = agent.render_flight_section(
+        {
+            "outbound_date": "2027-03-15",
+            "return_date": "2027-03-18",
+            "itineraries": [
+                {
+                    "price": "",
+                    "currency": "EUR",
+                    "booking_url": "https://kiwi.com/blank",
+                    "legs": ["LIS -> OPO TAP TP238"],
+                }
+            ],
+        }
+    )
+    assert "price unavailable" in text
+    assert "- EUR" not in text
+    assert "https://kiwi.com/blank" in text
