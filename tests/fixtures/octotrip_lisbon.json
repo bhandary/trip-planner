@@ -1,0 +1,43 @@
+{
+  "results": [
+    {
+      "name": "Peugeot 2008",
+      "vendor": "CRC Car Rental Company",
+      "price": 49.4,
+      "currency": "EUR",
+      "category": "Compact",
+      "booking_url": "https://mcp.octotrip.app/rental-cars/r/peugeot-2008",
+      "sipp": "CFMR"
+    },
+    {
+      "name": "Peugeot 308",
+      "vendor": "CRC Car Rental Company",
+      "price": 49.51,
+      "currency": "EUR",
+      "category": "Compact",
+      "booking_url": "https://mcp.octotrip.app/rental-cars/r/peugeot-308",
+      "sipp": "CDMR"
+    },
+    {
+      "name": "Mercedes-Benz A-Class",
+      "vendor": "Masterkings",
+      "price": 95.88,
+      "currency": "EUR",
+      "category": "Compact Elite",
+      "booking_url": "https://mcp.octotrip.app/rental-cars/r/a-class",
+      "sipp": "DDAD"
+    },
+    {
+      "name": "BMW 1 Series",
+      "vendor": "Autounion",
+      "price": 107.74,
+      "currency": "EUR",
+      "category": "Compact Elite",
+      "booking_url": "https://mcp.octotrip.app/rental-cars/r/bmw-1",
+      "sipp": "DDAR"
+    }
+  ],
+  "total": 28,
+  "total_available": 164,
+  "pickup_location_resolved": "Lisboa Prior Velho"
+}
