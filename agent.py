@@ -1863,7 +1863,7 @@ def render_kiwi_itineraries(payload: Any, args: dict[str, Any] | None = None) ->
             except json.JSONDecodeError:
                 data = None
         if isinstance(data, dict):
-            if data.get("error") or data.get("message"):
+            if _flight_payload_is_outage(data):
                 return FLIGHT_SOURCE_UNAVAILABLE
             if any(key in data and not data.get(key) for key in ("itineraries", "flights", "results")):
                 return NO_FLIGHTS_FOUND
@@ -2249,6 +2249,15 @@ def stash_flight_search(search: dict[str, Any]) -> None:
 
 NO_FLIGHTS_FOUND = "No flights found for these dates."
 FLIGHT_SOURCE_UNAVAILABLE = "The flight source is unavailable."
+_FLIGHT_OUTAGE = re.compile(r"unavailable|time-?d?\s*out|rate[\s-]*limit|upstream", re.I)
+
+
+def _flight_payload_is_outage(data: dict[str, Any]) -> bool:
+    """An ``error`` key, or a message that the source failed. ``No results`` is an empty search."""
+    if data.get("error"):
+        return True
+    message = data.get("message")
+    return isinstance(message, str) and bool(_FLIGHT_OUTAGE.search(message))
 
 
 def _flight_result_texts(messages: list[Any]) -> list[str]:
@@ -2287,7 +2296,7 @@ def _result_reports_no_flights(text: str) -> bool:
         return False
     data = _json_object(text)
     if data is not None:
-        if data.get("error") or data.get("message"):
+        if _flight_payload_is_outage(data):
             return False
         return any(key in data and not data.get(key) for key in ("itineraries", "flights", "results"))
     return NO_FLIGHTS_FOUND in (text or "")
@@ -2434,8 +2443,9 @@ def _line_restates_flight_fields(line: str, record: dict[str, Any]) -> bool:
     if not itineraries:
         return False
     first = itineraries[0]
-    price = str(first.get("price") or "").split()[0]
-    if price and price in line:
+    parts = str(first.get("price") or "").split()
+    price = parts[0] if parts else ""
+    if price and re.search(rf"\b{re.escape(price)}\b", line):
         return True
     numbers = _record_flight_numbers({"itineraries": [first]})
     return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
@@ -3054,7 +3064,8 @@ def _skippable_section_line(kind: str, line: str) -> bool:
     """Lines that belong to the coordinator's old cars or hotels block."""
     stripped = line.strip()
     if not stripped:
-        return True
+        # A blank line ends the hotels or flights list. Later bullets are a new list.
+        return kind not in {"flights", "hotels"}
     if _section_kind(line):
         return False
     if _label_only_line(line):
@@ -3067,11 +3078,15 @@ def _skippable_section_line(kind: str, line: str) -> bool:
         return True
     if kind == "hotels" and (stripped.startswith(("-", "*", "•")) or stripped.startswith("**")):
         return True
-    if kind == "flights" and stripped.startswith(("-", "*", "•")):
-        # A day line is the itinerary. Other bullets are the old flight list.
+    if kind == "flights":
+        # Day plans and labelled alternates stay. Other bullets and leftover fares
+        # belong to the old list, and only until the first blank line.
         if re.match(r"[-*•]\s*day\s+\d+\b", stripped, re.I):
             return False
-        return True
+        if _labelled_alternate_flight(line):
+            return False
+        if stripped.startswith(("-", "*", "•")) or _stale_flight_offer_line(line):
+            return True
     return False
 
 
@@ -3485,8 +3500,15 @@ def _drop_named_lines(answer: str, names: set[str]) -> str:
     return "\n".join(kept).strip()
 
 
+def _labelled_alternate_flight(line: str) -> bool:
+    """A coordinator alternate for other dates, which the prompt allows beside the search."""
+    return bool(re.search(r"\balternate\b", line, re.I) and re.search(r"different dates", line, re.I))
+
+
 def _stale_flight_offer_line(line: str) -> bool:
     """A leftover fare under an empty Flights heading: a Kiwi link, or a number beside a price."""
+    if _labelled_alternate_flight(line):
+        return False
     if re.search(r"kiwi\.com", line, re.I):
         return True
     return bool(_FLIGHT_PRICE.search(line) and re.search(r"\b[A-Z]{1,3}\d{2,4}\b", line))

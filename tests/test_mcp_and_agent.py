@@ -2496,3 +2496,139 @@ def test_bold_checkin_sentence_is_not_a_hotel_heading():
     assert "**Hotel check-in is at 3 PM.**" in text
     assert "Old Capitol Hotel" not in text
     assert "Memmo Alfama" in text
+
+
+def test_blank_fare_does_not_crash_and_short_price_is_bounded():
+    blank = {
+        "outbound_date": "2027-03-15",
+        "return_date": "2027-03-18",
+        "itineraries": [
+            {
+                "price": "",
+                "currency": "EUR",
+                "booking_url": "https://kiwi.com/blank",
+                "legs": ["LIS -> OPO TAP TP238"],
+            }
+        ],
+    }
+    text = agent.replace_flight_section("Flights:\n- x\nPrice: TBD", blank)
+    assert "Price: TBD" in text
+
+    twelve = {
+        "outbound_date": "2027-03-15",
+        "return_date": "2027-03-18",
+        "itineraries": [
+            {
+                "price": "12",
+                "currency": "EUR",
+                "booking_url": "https://kiwi.com/twelve",
+                "legs": ["LIS -> OPO TAP TP999"],
+            }
+        ],
+    }
+    text = agent.replace_flight_section(
+        "Flights:\nPrice: $12\nReturn: the later fare is $120",
+        twelve,
+    )
+    assert "Price: $12" not in text
+    assert "Return: the later fare is $120" in text
+
+
+def test_flight_list_stops_at_the_first_blank_line():
+    flights = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [_tap_round_trip(320, "https://kiwi.com/default-sort")],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    rendered = agent.render_flight_section(flights)
+    text = agent.apply_coordinator_checks(
+        "Flights:\n"
+        "- old TP238 line\n"
+        "\n"
+        "- Bring a passport valid 6 months\n"
+        "- Lisbon airport metro is 1.80 EUR\n"
+        "Enjoy.\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("FLIGHTS", flights),
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ],
+    )
+    assert "old TP238 line" not in text
+    assert "- Bring a passport valid 6 months" in text
+    assert "- Lisbon airport metro is 1.80 EUR" in text
+    assert "Enjoy." in text
+    assert rendered.splitlines()[0] in text
+
+
+def test_no_results_message_is_empty_not_an_outage():
+    empty = agent.render_kiwi_itineraries({"itineraries": [], "message": "No results for these dates"})
+    outage = agent.render_kiwi_itineraries({"results": None, "message": "upstream timeout"})
+    assert empty == "No flights found for these dates."
+    assert outage == "The flight source is unavailable."
+    text = agent.apply_coordinator_checks(
+        "Flights:\n- TAP TP238 — 410 EUR\n",
+        [
+            ToolMessage(
+                '{"itineraries": [], "message": "No results for these dates"}',
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ],
+    )
+    assert "No flights found for these dates." in text
+    assert "The flight source is unavailable." not in text
+    assert "410 EUR" not in text
+
+
+def test_labelled_alternate_survives_an_empty_flight_search():
+    text = agent.apply_coordinator_checks(
+        "Flights:\n"
+        "- 320 EUR https://kiwi.com/default-sort\n"
+        "- Alternate (different dates): TP240 on Dec 3, 280 EUR\n",
+        [ToolMessage("No flights found for these dates.", name="search_flights", tool_call_id="flights")],
+    )
+    assert "No flights found for these dates." in text
+    assert "https://kiwi.com/default-sort" not in text
+    assert "- Alternate (different dates): TP240 on Dec 3, 280 EUR" in text
+
+
+def test_bold_checkin_after_hotel_list_survives_the_blank_line():
+    record = {
+        "city": "Lisbon",
+        "checkin": "2027-03-15",
+        "checkout": "2027-03-18",
+        "hotels": [
+            {
+                "name": "Memmo Alfama",
+                "nightly": "€200",
+                "total": "€600",
+                "link": "https://skiplagged.com/hotel/memmo",
+            }
+        ],
+    }
+    rendered = agent.render_hotel_section(record)
+    text = agent.apply_coordinator_checks(
+        "Hotels:\n"
+        "- Old Capitol Hotel — €100\n"
+        "\n"
+        "**Hotel check-in is at 3 PM.**\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("HOTELS", record),
+                name="search_hotels",
+                tool_call_id="hotels",
+            )
+        ],
+    )
+    assert "Old Capitol Hotel" not in text
+    assert "**Hotel check-in is at 3 PM.**" in text
+    assert "Memmo Alfama" in text
