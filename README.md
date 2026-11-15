@@ -6,8 +6,18 @@ A coordinator agent plans a trip and delegates to flight, hotel, rental car, res
 
 - Python 3.11+
 - Node 22 and pnpm 10 (for the UI)
-- `OPENAI_API_KEY` for a real hosted model. Without it, set `TRIP_PLANNER_FAKE_LLM=1` to run the same graph with an offline stand-in. Do not set that flag on Railway.
-- Optional: `TAVILY_API_KEY` for web search, and `GOOGLE_MAPS_KEY` (or `GOOGLE_MAPS_API_KEY`) for restaurant and bar places.
+
+### Required environment variables
+
+Copy `.env.example` to `.env`. Do not commit real keys.
+
+| Variable | Role |
+| --- | --- |
+| `OPENAI_API_KEY` | Hosted chat model. Required for a real plan. Without it, set `TRIP_PLANNER_FAKE_LLM=1` to run the same graph offline. Do not set that flag on Railway. |
+| `TAVILY_API_KEY` | Web search for gaps the MCP servers do not cover. |
+| `GOOGLE_MAPS_API_KEY` | Google Maps Grounding Lite for restaurants and bars. `GOOGLE_MAPS_KEY` is an accepted alias. |
+
+The process can boot and serve `GET /health` without these keys. A live trip plan needs all three.
 
 ```bash
 python3 -m venv .venv
@@ -53,52 +63,62 @@ make probe
 | Agent | Primary | Fallback |
 | --- | --- | --- |
 | Flights | [Kiwi](https://mcp.kiwi.com) | none |
-| Hotels | [lastminute.com](https://mcp.lastminute.com/mcp) | [Skiplagged](https://mcp.skiplagged.com/mcp) |
+| Hotels | [Skiplagged](https://mcp.skiplagged.com/mcp) | none (lastminute.com is not called) |
 | Rental cars | [OctoTrip](https://mcp.octotrip.app/rental-cars/mcp) | [Upfront Rentals](https://www.upfront-rentals.com/MCP/Streamable) |
 | Restaurants and bars | [Google Maps Grounding Lite](https://mapstools.googleapis.com/mcp) | none |
 
-Kiwi, lastminute.com, Skiplagged, OctoTrip, and Upfront Rentals are called with no API key. OctoTrip blocks the default HTTP client user agent, so the car agent sends `User-Agent: Mozilla/5.0 (compatible; trip-planner/1.0)`. Google Maps is added only when `GOOGLE_MAPS_KEY` or `GOOGLE_MAPS_API_KEY` is set, and the header is `X-Goog-Api-Key`. If that key is missing, the restaurant and bar agents skip Maps and say so.
+Kiwi, Skiplagged, OctoTrip, and Upfront Rentals are called with no API key. OctoTrip blocks the default HTTP client user agent, so the car agent sends `User-Agent: Mozilla/5.0 (compatible; trip-planner/1.0)`. Google Maps is added only when `GOOGLE_MAPS_KEY` or `GOOGLE_MAPS_API_KEY` is set, and the header is `X-Goog-Api-Key`. If that key is missing, the restaurant and bar agents skip Maps and say so.
+
+lastminute.com documents a streamable-HTTP server at `https://mcp.lastminute.com/mcp`. From this environment every probe (browser and client user agents, `Accept: application/json` and `Accept: application/json, text/event-stream`, GET and POST, `/mcp`, `/sse`, and `/`) returns HTTP 403 `cf-mitigated: challenge` HTML, with no `mcp-session-id`. The MCP streamable-HTTP client maps that non-JSON error to JSON-RPC `-32603` (`Server returned an error response`). Headers, Accept, transport, path, and session handling do not get past the Cloudflare challenge, so the hotel agent does not call lastminute.com and does not retry it. The process logs one warning.
 
 Tavily (`langchain-tavily`) is a general web search tool for gaps: events, attractions, advisories, hours, and fees. It is not a substitute for live MCP prices. Without `TAVILY_API_KEY` the tool returns an error payload instead of raising.
 
-If a primary server errors or times out, the hotel and car agents use the fallback server. If both fail, the specialist says the source is unavailable and does not crash the run.
+If the car server errors or times out, the car agent uses Upfront Rentals. If a source fails, the specialist says it is unavailable and does not crash the run.
 
 `langchain-mcp-adapters` is archived. Tool loading uses `langchain.mcp.MCPAdapter` (`list_tools` on one server), which replaces `MultiServerMCPClient.get_tools(server_name=...)`.
 
 ## Deploy to Railway
 
-Do this as two services from this repo. No LangSmith license is required.
-
-The backend is `langgraph dev` (`langgraph-cli[inmem]`). It speaks the Agent Server protocol the chat UI uses (threads, runs, streaming) and does not need `LANGGRAPH_CLOUD_LICENSE_KEY`. `langgraph up` is the licensed deployment path, so it is not used here. The tradeoff is that threads stay on the instance disk and disappear when the container is replaced.
+Two services from this repo. Do not deploy `langgraph up` for this first cut. That command builds the licensed Agent Server.
 
 ### Backend service
 
 - Root directory: repository root
-- Config: `Dockerfile` and `railway.toml`
-- Listens on `0.0.0.0:$PORT`
+- Config: `Dockerfile`, `railway.toml`, and `Procfile`
+- Build: the Dockerfile installs the package and runs `scripts/start-backend.sh`
+- Start command: `sh scripts/start-backend.sh`
+- Bind: `langgraph dev --host 0.0.0.0 --port $PORT` (`PORT` defaults to 2024)
 - Health check: `GET /health`
-- Variables: `OPENAI_API_KEY`, and any of `OPENAI_MODEL`, `TRIP_PLANNER_MODEL`, `TAVILY_API_KEY`, `GOOGLE_MAPS_KEY`, `MCP_TIMEOUT_SECONDS`. Leave `TRIP_PLANNER_FAKE_LLM` unset.
+- Variables: `OPENAI_API_KEY`, `TAVILY_API_KEY`, `GOOGLE_MAPS_API_KEY`, and `PORT` (Railway sets `PORT`). Also set `CORS_ALLOW_ORIGINS` to the UI origin (below). Optional: `OPENAI_MODEL`, `TRIP_PLANNER_MODEL`, `GOOGLE_MAPS_KEY`, `MCP_TIMEOUT_SECONDS`. Leave `TRIP_PLANNER_FAKE_LLM` unset.
 
-Generate a public domain. The examples below assume the service is named `trip-planner`.
+Generate a public domain. The frontend example assumes this service is named `trip-planner`.
+
+The browser calls this API from the UI's origin. LangGraph reads `CORS_ALLOW_ORIGINS` (comma-separated). Its own default is `*`. The start script does not use that: when the variable is unset it allows `http://localhost:3000` and `http://127.0.0.1:3000` only. On Railway set the UI's public origin, for example `https://trip-planner-ui.up.railway.app`.
 
 Every MCP server in this project is remote streamable HTTP. The backend image does not install Node, and it does not spawn `npx` or stdio MCP processes. A server that is down is reported as unavailable.
 
-### Frontend service
+### UI service
 
 - Root directory: `ui`
-- Config: `ui/Dockerfile` and `ui/railway.toml`
-- Listens on `0.0.0.0:$PORT`
+- Config: `ui/Dockerfile` and `ui/railway.toml` (same shape as the hike-ui service: Dockerfile builder, health check `/health`, no start-command override)
+- Build command: `pnpm build` inside the image. `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_ASSISTANT_ID` are build args.
+- Start command: `node server.js` (the image CMD). Locally, after `pnpm build`, `pnpm start` is `next start -H 0.0.0.0 -p $PORT`.
+- Bind: `0.0.0.0` and `$PORT` (`PORT` defaults to 3000)
 - Health check: `GET /health`
-- Build-time variables (Next.js inlines `NEXT_PUBLIC_*` during `pnpm build`):
+- Backend URL: `NEXT_PUBLIC_API_URL`. The UI reads that name (see `ui/next.config.mjs` and `ui/src/providers/Stream.tsx`). If it is unset at build time, the default is `http://localhost:2024`.
+
+`NEXT_PUBLIC_*` is inlined by `next build`. Set it on the UI service before the Docker build, then redeploy when it changes. A new value in the running container does nothing until the next build.
 
 ```
 NEXT_PUBLIC_API_URL=https://${{trip-planner.RAILWAY_PUBLIC_DOMAIN}}
 NEXT_PUBLIC_ASSISTANT_ID=trip_planner
 ```
 
-`NEXT_PUBLIC_API_URL` is a Railway reference variable. It must be set on the frontend service before the Docker build, because the Dockerfile declares matching `ARG`s and the browser bundle bakes in the value. Redeploy the frontend after the backend domain exists.
+Copy `ui/.env.example` to `ui/.env` for local `pnpm dev`. Do not put API keys in it.
 
-The browser calls the backend directly, so the backend URL has to be reachable from the user's browser.
+### Production upgrade
+
+This first deploy uses `langgraph dev` (in-memory, dev server). For production move to `langgraph build` / `langgraph up` or the LangGraph platform image with Postgres and Redis. `langgraph up` needs `LANGGRAPH_CLOUD_LICENSE_KEY`. Threads from `langgraph dev` disappear when the container is replaced.
 
 ## Layout
 
