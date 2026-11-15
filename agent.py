@@ -448,12 +448,9 @@ def attach_call_fallback(tool: BaseTool, alt_server: str) -> BaseTool:
             raw_age = kwargs.get("age", kwargs.get("driver_age"))
             stated = None if raw_age in (None, "", 30, "30", "30+", 30.0) else raw_age
             note = driver_age_note(stated)
-            if isinstance(result, str):
-                result = f"{result}\n{note}"
-            elif isinstance(result, tuple) and result:
-                result = (f"{result[0]}\n{note}", result[1])
-            else:
-                result = f"{result}\n{note}"
+            # Parse the supplier payload here, before any specialist prose exists.
+            sealed = seal_car_tool_result(result, kwargs)
+            return _tool_result(tool, f"{sealed}\n{note}")
         if isinstance(result, tuple):
             return result
         return _tool_result(tool, result)
@@ -922,8 +919,11 @@ async def build_specialists(model: BaseChatModel | None = None) -> dict[str, Any
     place_tools = [attach_date_strip(item) for item in place_tools]
     if hotel_source == "hotels":
         hotel_tools = [attach_call_fallback(item, "hotels_alt") for item in hotel_tools]
+    hotel_tools = [attach_hotel_capture(item) for item in hotel_tools]
     if car_source == "cars":
         car_tools = [attach_call_fallback(item, "cars_alt") for item in car_tools]
+    else:
+        car_tools = [attach_car_capture(item) for item in car_tools]
 
     shared = [web_search]
     flight_agent = create_agent(
@@ -1172,6 +1172,8 @@ HOTEL_FIELD_LABELS = {
     "neighbourhood",
     "nightly rate",
     "cancellation",
+    "cancellation policy",
+    "booking link",
     "tradeoff",
     "trade-off",
     "trade off",
@@ -1210,9 +1212,18 @@ def extract_skiplagged_hotels(text: str) -> list[str]:
 
 
 def extract_hotel_names(text: str) -> list[str]:
-    """Hotel names from a HOTELS block or Skiplagged table. Field labels are not hotels."""
+    """Property names from a captured Skiplagged payload. Field labels are not hotels."""
     if not text:
         return []
+    record = read_structured(text, "HOTELS")
+    if record:
+        return [
+            str(hotel.get("name")).strip()
+            for hotel in record.get("hotels") or []
+            if isinstance(hotel, dict)
+            and str(hotel.get("name") or "").strip()
+            and not _is_hotel_label(str(hotel.get("name")))
+        ]
     names: list[str] = []
     seen: set[str] = set()
 
@@ -1401,29 +1412,6 @@ def render_grounded_specialist(prose: str, allowed: set[str], evidence: str, too
         prose = "No grounded venues to recommend."
     listed = " | ".join(sorted(allowed, key=str.lower))
     return prose.strip() + f"\nVENUES: {listed}"
-
-
-def ensure_hotels_kept(answer: str, names: list[str]) -> str:
-    """Keep every hotel the specialist returned unless the answer explains the omission."""
-    missing: list[str] = []
-    reason = re.compile(
-        r"\b(because|excluded|omitted|dropped|left out|not included|too far|sold out|unavailable|skip)\b",
-        re.I,
-    )
-    for name in names:
-        if name.casefold() in answer.casefold():
-            continue
-        token = name.split()[0]
-        explained = any(
-            token.casefold() in sentence.casefold() and reason.search(sentence)
-            for sentence in re.split(r"(?<=[.!\n])\s+", answer)
-        )
-        if not explained:
-            missing.append(name)
-    if not missing:
-        return answer
-    extra = "\n".join(f"- {name}" for name in missing)
-    return answer.rstrip() + "\n\nHotels returned by the hotel specialist (kept):\n" + extra
 
 
 _MONTHS = {
@@ -1987,85 +1975,316 @@ def _json_values(text: str) -> list[Any]:
     return values
 
 
-def _car_line(offer: CarOffer) -> str:
-    parts = [offer.name, offer.price]
-    if offer.vendor:
-        parts.append(offer.vendor)
-    if offer.link:
-        parts.append(offer.link)
-    return "- " + " | ".join(parts)
+def format_structured(kind: str, record: dict[str, Any]) -> str:
+    return (
+        f"<<<STRUCTURED_{kind}>>>\n"
+        + json.dumps(record, ensure_ascii=False)
+        + f"\n<<<END_STRUCTURED_{kind}>>>"
+    )
 
 
-def extract_car_offers(text: str) -> list[CarOffer]:
-    """Vehicle, price, vendor, and link from an OctoTrip payload or a CARS block."""
+def read_structured(text: str, kind: str) -> dict[str, Any] | None:
+    """Read a record this code wrote at tool-call time. Specialist prose is ignored."""
+    match = re.search(
+        rf"<<<STRUCTURED_{kind}>>>\s*(\{{.*?\}})\s*<<<END_STRUCTURED_{kind}>>>",
+        text or "",
+        re.S,
+    )
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _payload_data(value: Any) -> Any:
+    if isinstance(value, tuple) and value:
+        return _payload_data(value[0])
+    if isinstance(value, list) and value and all(
+        isinstance(item, dict) and "text" in item for item in value
+    ):
+        return _coerce_payload(value)
+    if isinstance(value, str):
+        return _coerce_payload(value)
+    return value
+
+
+def _first_arg(args: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = args.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def car_record_from_payload(payload: Any, args: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """OctoTrip results[].name/price/currency/vendor/booking_url, captured from the tool payload."""
+    args = args or {}
+    data = _payload_data(payload)
     found: list[CarOffer] = []
-    for value in _json_values(text or ""):
-        _walk_car_offers(value, found)
-    for line in (text or "").splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("- "):
-            continue
-        parts = [part.strip() for part in stripped[2:].split("|")]
-        if len(parts) >= 4:
-            found.append(CarOffer(parts[0], parts[1], parts[2], parts[3]))
-        elif len(parts) == 3:
-            found.append(CarOffer(parts[0], parts[1], parts[2], ""))
-        elif len(parts) == 2:
-            found.append(CarOffer(parts[0], parts[1], "", ""))
-    unique: list[CarOffer] = []
-    seen: set[tuple[str, str, str]] = set()
+    if isinstance(data, str):
+        for value in _json_values(data):
+            _walk_car_offers(value, found)
+    else:
+        _walk_car_offers(data, found)
+    if not found:
+        return None
+    pickup = _first_arg(args, ("location", "pickup", "pickup_location", "pickUpLocation", "city"))
+    if not pickup and isinstance(data, dict) and isinstance(data.get("pickup_location_resolved"), str):
+        pickup = data["pickup_location_resolved"].strip()
+    offers: list[dict[str, str]] = []
     for offer in found:
-        key = (offer.name.casefold(), offer.price, offer.link)
-        if key in seen:
+        parts = offer.price.split()
+        amount = parts[0] if parts else offer.price
+        currency = parts[1] if len(parts) > 1 else ""
+        offers.append(
+            {
+                "name": offer.name,
+                "price": amount,
+                "currency": currency,
+                "vendor": offer.vendor,
+                "booking_url": offer.link,
+            }
+        )
+    return {
+        "pickup": pickup,
+        "dropoff": _first_arg(args, ("dropoff_location", "dropoff", "dropOffLocation")),
+        "pickup_date": _first_arg(args, ("pickup_date", "pickupDate", "from", "start_date")),
+        "dropoff_date": _first_arg(args, ("dropoff_date", "dropoffDate", "to", "end_date")),
+        "offers": offers,
+    }
+
+
+def seal_car_tool_result(result: Any, args: dict[str, Any] | None = None) -> str:
+    """Turn a raw car-tool return into text plus a structured record. Prose is not parsed."""
+    payload = result[0] if isinstance(result, tuple) and result else result
+    record = car_record_from_payload(payload, args)
+    if isinstance(payload, (dict, list)):
+        body = json.dumps(payload)
+    else:
+        body = _message_text(payload)
+    if record:
+        body = body.rstrip() + "\n" + format_structured("CARS", record)
+    return body
+
+
+def _price_key(offer: dict[str, Any]) -> float:
+    try:
+        return float(str(offer.get("price") or "").split()[0])
+    except ValueError:
+        return 1e18
+
+
+def _when_span(start: str, end: str) -> str:
+    start, end = start.strip(), end.strip()
+    if start and end:
+        return f" ({start} to {end})"
+    if start or end:
+        return f" ({start or end})"
+    return ""
+
+
+def render_car_section(record: dict[str, Any]) -> str:
+    """Top 5 offers by price. The heading always names the pickup and any dates."""
+    place = (record.get("pickup") or "the pickup location").strip() or "the pickup location"
+    heading = (
+        f"Rental Cars in {place}"
+        + _when_span(str(record.get("pickup_date") or ""), str(record.get("dropoff_date") or ""))
+        + ":"
+    )
+    ranked = sorted(record.get("offers") or [], key=_price_key)[:5]
+    lines = [heading]
+    for offer in ranked:
+        if not isinstance(offer, dict):
             continue
-        seen.add(key)
-        unique.append(offer)
-    return unique
+        price = f"{offer.get('price') or ''} {offer.get('currency') or ''}".strip()
+        bits = [str(offer.get("name") or "Vehicle"), price or "price unavailable"]
+        if offer.get("vendor"):
+            bits.append(str(offer["vendor"]))
+        if offer.get("booking_url"):
+            bits.append(str(offer["booking_url"]))
+        lines.append("- " + " | ".join(bits))
+    return "\n".join(lines)
 
 
-def offers_to_keep(car_text: str) -> list[CarOffer]:
-    """Offers the specialist named. If it named none, the first few structured offers."""
-    offers = extract_car_offers(car_text)
-    if not offers:
-        return []
-    prose = car_text.split("CARS:")[0]
-    presented = [offer for offer in offers if offer.name.casefold() in prose.casefold()]
-    if presented:
-        return presented
-    return offers[:4]
+def hotel_record_from_payload(payload: Any, args: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Skiplagged hotel rows captured from the tool payload, not from specialist prose."""
+    args = args or {}
+    text = payload if isinstance(payload, str) else _message_text(payload)
+    hotels: list[dict[str, str]] = []
+    for line in text.splitlines():
+        if not line.startswith("|") or re.match(r"^\|\s*-+", line):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if not cells:
+            continue
+        name_match = re.search(r"\*\*([^*|\n]+)\*\*", cells[0])
+        if not name_match:
+            continue
+        name = re.sub(r"\s+", " ", name_match.group(1)).strip()
+        if not name or _is_hotel_label(name):
+            continue
+        link_match = re.search(r"\((https?://[^)\s]+)\)", cells[-1])
+        hotels.append(
+            {
+                "name": name,
+                "nightly": cells[2] if len(cells) > 2 else "",
+                "total": cells[3] if len(cells) > 3 else "",
+                "link": link_match.group(1) if link_match else "",
+            }
+        )
+    if not hotels:
+        return None
+    checkin = _first_arg(args, ("checkin", "check_in", "checkIn"))
+    checkout = _first_arg(args, ("checkout", "check_out", "checkOut"))
+    if not checkin:
+        found = re.search(r"Check-in:\s*(\d{4}-\d{2}-\d{2})", text)
+        checkin = found.group(1) if found else ""
+    if not checkout:
+        found = re.search(r"Check-out:\s*(\d{4}-\d{2}-\d{2})", text)
+        checkout = found.group(1) if found else ""
+    return {
+        "city": _first_arg(args, ("city", "destination", "location")),
+        "checkin": checkin,
+        "checkout": checkout,
+        "hotels": hotels,
+    }
 
 
-def render_car_block(text: str) -> str:
-    offers = extract_car_offers(text)
-    if not offers:
-        return ""
-    lines = "\n".join(_car_line(offer) for offer in offers)
-    return f"CARS:\n{lines}"
+def render_hotel_section(record: dict[str, Any]) -> str:
+    city = (record.get("city") or "the destination").strip() or "the destination"
+    heading = (
+        f"Hotels in {city}"
+        + _when_span(str(record.get("checkin") or ""), str(record.get("checkout") or ""))
+        + ":"
+    )
+    lines = [heading]
+    for hotel in record.get("hotels") or []:
+        if not isinstance(hotel, dict):
+            continue
+        name = str(hotel.get("name") or "").strip()
+        if not name or _is_hotel_label(name):
+            continue
+        bits = [name]
+        if hotel.get("nightly"):
+            bits.append(f"{hotel['nightly']} per night")
+        if hotel.get("total"):
+            bits.append(f"{hotel['total']} total")
+        if hotel.get("link"):
+            bits.append(str(hotel["link"]))
+        lines.append("- " + " | ".join(bits))
+    return "\n".join(lines)
 
 
-def ensure_cars_kept(answer: str, car_text: str) -> str:
-    """Keep name, price, vendor, and link for the cars the specialist presented."""
-    if not car_text.strip():
-        return answer
-    missing: list[str] = []
-    for offer in offers_to_keep(car_text):
-        folded = answer.casefold()
-        amount = offer.price.split()[0]
-        present = offer.name.casefold() in folded and amount in answer
-        if offer.vendor and offer.vendor.casefold() not in folded:
-            present = False
-        if offer.link and offer.link not in answer:
-            present = False
-        if not present:
-            missing.append(_car_line(offer))
-    extra = ""
-    if missing:
-        extra += "\n\nRental cars returned by the specialist (kept):\n" + "\n".join(missing)
-    if ASSUMED_DRIVER_AGE in car_text and ASSUMED_DRIVER_AGE not in answer:
-        extra += "\n\n" + ASSUMED_DRIVER_AGE
-    if not extra:
-        return answer
-    return answer.rstrip() + extra
+def _section_kind(line: str) -> str | None:
+    stripped = re.sub(r"^[#>*\-\s]+", "", line).strip()
+    match = re.match(
+        r"(flights?|hotels?|rental cars?|car rental|restaurants?|dining|bars?)\b",
+        stripped,
+        re.I,
+    )
+    if not match:
+        return None
+    if len(stripped) > 90 and not stripped.endswith(":"):
+        return None
+    word = match.group(1).lower()
+    if word.startswith("flight"):
+        return "flights"
+    if word.startswith("hotel"):
+        return "hotels"
+    if word.startswith("rental") or word.startswith("car"):
+        return "cars"
+    if word.startswith("rest") or word.startswith("din"):
+        return "dining"
+    if word.startswith("bar"):
+        return "bars"
+    return None
+
+
+def _label_only_line(line: str) -> bool:
+    cleaned = re.sub(r"[*_`#]", "", line)
+    cleaned = re.sub(r"^[\-\d.)\s]+", "", cleaned).strip().strip(":").casefold()
+    return bool(cleaned) and cleaned in HOTEL_FIELD_LABELS
+
+
+def _skippable_section_line(kind: str, line: str) -> bool:
+    """Lines that belong to the coordinator's old cars or hotels block."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if _section_kind(line):
+        return False
+    if _label_only_line(line):
+        return True
+    if kind == "cars" and (
+        stripped.startswith(("-", "*", "•")) or re.search(r"https?://", stripped)
+    ):
+        return True
+    if kind == "hotels" and (stripped.startswith(("-", "*", "•")) or stripped.startswith("**")):
+        return True
+    return False
+
+
+def replace_named_section(answer: str, kind: str, new_section: str) -> str:
+    """Replace one plan section. Prose that follows it stays."""
+    lines = (answer or "").splitlines()
+    out: list[str] = []
+    skipping = False
+    inserted = False
+    for line in lines:
+        if _section_kind(line) == kind:
+            if not inserted:
+                out.extend(new_section.splitlines())
+                inserted = True
+            skipping = True
+            continue
+        if skipping and _skippable_section_line(kind, line):
+            continue
+        skipping = False
+        out.append(line)
+    text = "\n".join(out).strip()
+    if not inserted:
+        text = (text + "\n\n" + new_section).strip()
+    return text
+
+
+def replace_car_section(answer: str, record: dict[str, Any]) -> str:
+    section = render_car_section(record)
+    text = replace_named_section(answer, "cars", section)
+    urls = {
+        str(offer.get("booking_url"))
+        for offer in record.get("offers") or []
+        if isinstance(offer, dict) and offer.get("booking_url")
+    }
+    heading = section.splitlines()[0]
+    kept: list[str] = []
+    in_section = False
+    for line in text.splitlines():
+        if line == heading:
+            in_section = True
+        if not in_section and any(url and url in line for url in urls):
+            continue
+        if re.search(r"Rental Cars\s*\(\s*\)", line, re.I):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def replace_hotel_section(answer: str, record: dict[str, Any]) -> str:
+    section = render_hotel_section(record)
+    text = replace_named_section(answer, "hotels", section)
+    heading = section.splitlines()[0]
+    kept: list[str] = []
+    in_section = False
+    for line in text.splitlines():
+        if line == heading:
+            in_section = True
+        if not in_section and _label_only_line(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def separate_alternate_flights(answer: str, flight_text: str) -> str:
@@ -2136,6 +2355,48 @@ def ensure_flight_legs(answer: str, flight_text: str) -> str:
         + "\n\nFlight legs for the requested dates:\n\n"
         + "\n\n".join(missing)
     )
+
+
+def _block_price_text(block: str) -> str:
+    match = re.search(
+        r"(?m)^price:\s*([0-9]+(?:\.[0-9]+)?)(?:\s*([A-Za-z]{3}|€))?",
+        block or "",
+    )
+    if not match:
+        return ""
+    amount, currency = match.group(1), (match.group(2) or "").upper()
+    if amount.endswith(".0"):
+        amount = amount[:-2]
+    if currency == "€":
+        currency = "EUR"
+    return f"{amount} {currency}".strip()
+
+
+def ensure_flight_prices(answer: str, flight_text: str) -> str:
+    """Put each presented itinerary's price on that itinerary, in Kiwi's currency."""
+    if "ITINERARY" not in (flight_text or "") or not answer:
+        return answer
+    primary = flight_text.split("ALTERNATE DATES")[0]
+    blocks = _itinerary_blocks(primary)
+    presented = [
+        block for block in blocks if (link := _block_value(block, "booking_link")) and link in answer
+    ]
+    chosen = presented or blocks[:3]
+    for block in chosen:
+        price = _block_price_text(block)
+        link = _block_value(block, "booking_link")
+        if not price:
+            continue
+        amount = price.split()[0]
+        if link and link in answer:
+            index = answer.find(link)
+            window = answer[max(0, index - 80) : index + len(link)]
+            if amount in window and ("EUR" not in price or "EUR" in window or "€" in window):
+                continue
+            answer = answer.replace(link, f"{price} {link}", 1)
+        elif not re.search(rf"\b{re.escape(amount)}\b", answer):
+            answer = answer.rstrip() + f"\n- {price}" + (f" {link}" if link else "")
+    return answer
 
 
 def lock_flight_currency(answer: str, flight_text: str) -> str:
@@ -2233,12 +2494,17 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
         answer = scrub_overclaims(answer, restaurants + "\n" + bars, allowed)
         if dropped and (explicit_none or not allowed) and "unavailable" not in answer.lower():
             answer = answer.rstrip() + "\n\n" + VENUE_UNAVAILABLE
-    answer = ensure_hotels_kept(answer, hotel_names)
-    answer = ensure_cars_kept(answer, cars)
+    hotel_record = read_structured(hotels, "HOTELS")
+    if hotel_record:
+        answer = replace_hotel_section(answer, hotel_record)
+    car_record = read_structured(cars, "CARS")
+    if car_record:
+        answer = replace_car_section(answer, car_record)
     answer = enforce_assumed_driver_age(answer, messages, cars)
     answer = repair_flight_pairing(answer, flights)
     answer = separate_alternate_flights(answer, flights)
     answer = ensure_flight_legs(answer, flights)
+    answer = ensure_flight_prices(answer, flights)
     answer = lock_flight_currency(answer, flights)
     return answer
 
@@ -2260,6 +2526,51 @@ def coordinator_postcheck(state: dict[str, Any], runtime: Any) -> dict[str, Any]
 
 
 coordinator_postcheck_middleware = after_model(coordinator_postcheck)
+
+
+def _seal_tool_text(tool: BaseTool, content: Any, artifact: Any, sealed: str) -> Any:
+    if getattr(tool, "response_format", "content") == "content_and_artifact":
+        return (sealed, artifact)
+    return sealed
+
+
+def attach_car_capture(tool: BaseTool) -> BaseTool:
+    """Record OctoTrip or Upfront offers at tool-call time when the fallback wrapper is absent."""
+    if tool.coroutine is None or getattr(tool, "_trip_car_capture", False):
+        return tool
+    original = tool.coroutine
+
+    async def wrapped(**kwargs: Any) -> Any:
+        value = await original(**kwargs)
+        content, artifact = value if isinstance(value, tuple) and len(value) == 2 else (value, None)
+        return _seal_tool_text(tool, content, artifact, seal_car_tool_result(content, kwargs))
+
+    tool.coroutine = wrapped
+    setattr(tool, "_trip_car_capture", True)
+    return tool
+
+
+def attach_hotel_capture(tool: BaseTool) -> BaseTool:
+    """Record Skiplagged hotel rows at tool-call time."""
+    if tool.coroutine is None or getattr(tool, "_trip_hotel_capture", False):
+        return tool
+    original = tool.coroutine
+
+    async def wrapped(**kwargs: Any) -> Any:
+        value = await original(**kwargs)
+        content, artifact = value if isinstance(value, tuple) and len(value) == 2 else (value, None)
+        if isinstance(content, (dict, list)):
+            text = json.dumps(content)
+        else:
+            text = _message_text(content)
+        record = hotel_record_from_payload(text, kwargs)
+        if record:
+            text = text.rstrip() + "\n" + format_structured("HOTELS", record)
+        return _seal_tool_text(tool, content, artifact, text)
+
+    tool.coroutine = wrapped
+    setattr(tool, "_trip_hotel_capture", True)
+    return tool
 
 
 def attach_flight_binding(tool: BaseTool) -> BaseTool:
@@ -2323,34 +2634,28 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
             evidence = "\n".join(
                 _message_text(item.content) for item in messages if isinstance(item, ToolMessage)
             )
-            text = final_text(result)
-            block = render_car_block(evidence)
-            if block and "CARS:" not in text:
-                text = text.rstrip() + "\n\n" + block
+            record = read_structured(evidence, "CARS")
             user_text = _human_text(list(state.get("messages") or []))
             note = driver_age_note(stated_driver_age(user_text))
-            if note == ASSUMED_DRIVER_AGE:
-                text = re.sub(
-                    r"Driver age \d+ was taken from the request\.?",
-                    "",
-                    text,
+            if record:
+                # The car section is this record, not whatever the specialist model wrote.
+                return (
+                    render_car_section(record)
+                    + "\n\n"
+                    + note
+                    + "\n"
+                    + format_structured("CARS", record)
                 )
-                if ASSUMED_DRIVER_AGE not in text:
-                    text = text.rstrip() + "\n" + note
-            elif note not in text:
-                text = text.replace(ASSUMED_DRIVER_AGE, note)
-            return text.strip()
+            return (final_text(result).rstrip() + "\n" + note).strip()
         if key == "hotel":
             messages = result.get("messages") or []
             evidence = "\n".join(
                 _message_text(item.content) for item in messages if isinstance(item, ToolMessage)
             )
-            names = extract_skiplagged_hotels(evidence)
-            text = final_text(result)
-            if names and "HOTELS:" not in text:
-                listed = "\n".join(f"- {name}" for name in names)
-                text = text.rstrip() + f"\n\nHOTELS:\n{listed}"
-            return text
+            record = read_structured(evidence, "HOTELS")
+            if record:
+                return render_hotel_section(record) + "\n" + format_structured("HOTELS", record)
+            return final_text(result)
         if key in {"restaurant", "bar"}:
             messages = result.get("messages") or []
             tool_messages = [item for item in messages if isinstance(item, ToolMessage)]

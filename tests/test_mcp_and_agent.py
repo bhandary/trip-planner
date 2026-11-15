@@ -552,9 +552,25 @@ def test_hours_cuisine_and_meal_are_not_overclaimed():
 
 
 def test_coordinator_drops_credit_and_keeps_hotels_and_grounded_venues():
+    hotels = agent.format_structured(
+        "HOTELS",
+        {
+            "city": "Lisbon",
+            "checkin": "2027-03-15",
+            "checkout": "2027-03-18",
+            "hotels": [
+                {
+                    "name": "Ibis Parque das Nações",
+                    "nightly": "90 EUR",
+                    "total": "270 EUR",
+                    "link": "https://hotels.example/ibis",
+                }
+            ],
+        },
+    )
     messages = [
         ToolMessage(
-            "**Ibis Parque das Nações** — 90 EUR",
+            hotels + "\n**Cancellation policy**\n**Booking link**",
             name="search_hotels",
             tool_call_id="h",
         ),
@@ -565,19 +581,18 @@ def test_coordinator_drops_credit_and_keeps_hotels_and_grounded_venues():
         ),
         ToolMessage("VENUES: (none)", name="suggest_bars", tool_call_id="b"),
     ]
-    answer = "Skip the hotels.\nDinner at **Rafael Tonon**.\nAlso **Cervejaria Ramiro**."
+    answer = (
+        "Hotels\n**Cancellation policy**\n**Booking link**\n"
+        "Dinner at **Rafael Tonon**.\nAlso **Cervejaria Ramiro**."
+    )
     text = agent.apply_coordinator_checks(answer, messages)
     assert "Rafael Tonon" not in text
     assert "Cervejaria Ramiro" in text
     assert "Ibis Parque das Nações" in text
+    assert "Hotels returned by the hotel specialist" not in text
+    assert "Cancellation policy" not in text
+    assert "Booking link" not in text
     assert "unavailable" in text.lower()
-
-
-def test_hotel_omission_with_a_reason_is_kept():
-    answer = "Excluded Ibis Parque das Nações because it is sold out."
-    text = agent.ensure_hotels_kept(answer, ["Ibis Parque das Nações"])
-    assert text == answer
-    assert "Hotels returned" not in text
 
 
 def test_kiwi_itinerary_fields_stay_together_and_warn():
@@ -757,14 +772,30 @@ def test_car_names_prices_and_assumed_age_stay_in_the_plan():
                 "price": 49.4,
                 "currency": "EUR",
                 "booking_url": "https://cars.example/peugeot",
+                "category": "Compact",
             }
         ]
     }
-    specialist = json.dumps(offer) + "\n" + agent.driver_age_note(None)
-    answer = "Reserve https://cars.example/peugeot"
-    text = agent.ensure_cars_kept(answer, specialist)
+    specialist = agent.seal_car_tool_result(
+        offer,
+        {
+            "location": "Lisbon Airport",
+            "pickup_date": "2027-03-15",
+            "dropoff_date": "2027-03-18",
+        },
+    )
+    answer = "Rental Cars ():\n- https://cars.example/peugeot"
+    text = agent.apply_coordinator_checks(
+        answer,
+        [
+            HumanMessage(content="Plan Lisbon. No age was given."),
+            ToolMessage(specialist, name="suggest_rental_cars", tool_call_id="cars"),
+        ],
+    )
+    assert "Rental Cars ():" not in text
+    assert "Rental Cars in Lisbon Airport (2027-03-15 to 2027-03-18):" in text
     assert "Peugeot 2008" in text
-    assert "49.4" in text
+    assert "49.40" in text
     assert "CRC Car Rental Company" in text
     assert "https://cars.example/peugeot" in text
     assert "assumed driver age 30 — tell me yours if different" in text
@@ -816,24 +847,44 @@ def test_octotrip_offers_survive_a_heading_only_plan():
                 "category": "Compact",
                 "booking_url": "https://mcp.octotrip.app/rental-cars/r/a3",
             },
+            {
+                "name": "Ferrari Roma",
+                "vendor": "Masterkings",
+                "price": 900,
+                "currency": "EUR",
+                "category": "Luxury",
+                "booking_url": "https://mcp.octotrip.app/rental-cars/r/ferrari",
+            },
         ]
     }
-    prose = (
-        "Peugeot 208 36.89 EUR from CRC Car Rental Company. "
-        "Peugeot 308 40.41 EUR. BMW 1 Series 64.94 EUR. VW Polo 36.90 EUR."
-    )
-    specialist = prose + "\n\n" + agent.render_car_block(json.dumps(listed))
     padded = "search note\n" + json.dumps(fixture) + (" " * 25000)
-    parsed = agent.extract_car_offers(padded)
-    assert [offer.name for offer in parsed] == [
+    parsed = agent.car_record_from_payload(padded, {"location": "Lisbon Airport"})
+    assert parsed is not None
+    assert [offer["name"] for offer in parsed["offers"]] == [
         "Peugeot 2008",
         "Peugeot 308",
         "Mercedes-Benz A-Class",
         "BMW 1 Series",
     ]
-    assert parsed[0].vendor == "CRC Car Rental Company"
-    assert parsed[0].link.startswith("https://mcp.octotrip.app/rental-cars/r/")
-    answer = "Rental Cars in Lisbon Airport\n\nDriver age 30+."
+    assert parsed["offers"][0]["vendor"] == "CRC Car Rental Company"
+    assert parsed["offers"][0]["booking_url"].startswith("https://mcp.octotrip.app/rental-cars/r/")
+    specialist = (
+        "Rental Cars (): the writeup names nothing useful.\n"
+        + agent.seal_car_tool_result(
+            listed,
+            {
+                "location": "Lisbon Airport",
+                "pickup_date": "2027-03-15",
+                "dropoff_date": "2027-03-18",
+            },
+        )
+    )
+    answer = (
+        "Rental Cars ():\n"
+        "- https://mcp.octotrip.app/rental-cars/r/208\n"
+        "- https://mcp.octotrip.app/rental-cars/r/polo\n"
+        "Driver age 30+."
+    )
     text = agent.apply_coordinator_checks(
         answer,
         [
@@ -841,11 +892,13 @@ def test_octotrip_offers_survive_a_heading_only_plan():
             ToolMessage(specialist, name="suggest_rental_cars", tool_call_id="cars"),
         ],
     )
-    for name in ("Peugeot 208", "Peugeot 308", "BMW 1 Series", "VW Polo"):
+    for name in ("Peugeot 208", "Peugeot 308", "BMW 1 Series", "VW Polo", "Audi A3"):
         assert name in text
     assert "36.89" in text and "40.41" in text and "64.94" in text and "36.90" in text
     assert "Autounion" in text and "https://mcp.octotrip.app/rental-cars/r/polo" in text
-    assert "Audi A3" not in text
+    assert "Ferrari Roma" not in text
+    assert "Rental Cars ():" not in text
+    assert "Rental Cars in Lisbon Airport (2027-03-15 to 2027-03-18):" in text
     assert "assumed driver age 30 — tell me yours if different" in text
     assert "30+" not in text
 
@@ -871,17 +924,27 @@ def test_hotel_field_labels_are_not_hotel_names():
     )
     names = agent.extract_hotel_names(prose)
     assert names == []
-    specialist = prose + "\n\nHOTELS:\n" + "\n".join(
-        f"- {name}" for name in agent.extract_skiplagged_hotels(table)
+    record = agent.hotel_record_from_payload(
+        table, {"city": "Lisbon", "checkin": "2027-03-15", "checkout": "2027-03-18"}
     )
-    answer = "Hotels in Lisbon."
+    assert record is not None
+    specialist = prose + "\n" + agent.format_structured("HOTELS", record)
+    answer = "Hotels in Lisbon.\n**Cancellation policy**\n**Booking link**"
     text = agent.apply_coordinator_checks(
         answer,
         [ToolMessage(specialist, name="search_hotels", tool_call_id="hotels")],
     )
     assert "Inn Rossio Hotel" in text
     assert "Hotel ibis Lisboa Jose Malhoa" in text
-    for label in ("Neighborhood", "Nightly rate", "Cancellation", "Tradeoff"):
+    assert "Hotels returned by the hotel specialist" not in text
+    for label in (
+        "Neighborhood",
+        "Nightly rate",
+        "Cancellation",
+        "Tradeoff",
+        "Cancellation policy",
+        "Booking link",
+    ):
         assert label not in text
 
 
@@ -1071,3 +1134,204 @@ async def test_list_tools_retries_before_fallback(monkeypatch):
     with pytest.raises(MCPError):
         await agent.list_server_tools("kiwi")
     assert state["n"] == 1
+
+
+class UnparseablePlanModel(agent.FakeTripModel):
+    """Coordinator and specialists write car and hotel prose that cannot be parsed."""
+
+    def _once(self, messages, name, args, prose):
+        if name not in agent._tool_names(self.bound_tools):
+            return AIMessage(content=prose)
+        if name not in agent._called_tools(messages):
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": name, "args": args, "id": f"call_{name}", "type": "tool_call"}],
+            )
+        return AIMessage(content=prose)
+
+    def _respond(self, messages):
+        system = agent._system_text(messages)
+        names = agent._tool_names(self.bound_tools)
+        user = agent._human_text(messages)
+        coordinator = "trip planner coordinator" in system or (
+            "update_state" in names and "search_flights" in names
+        )
+        if coordinator:
+            return self._bad_plan(messages, names, user)
+        if "rental car specialist" in system:
+            return self._once(
+                messages,
+                "search",
+                {
+                    "location": "Lisbon Airport",
+                    "pickup_date": "2027-03-15",
+                    "dropoff_date": "2027-03-18",
+                },
+                "Rental Cars ():\nnothing named here",
+            )
+        if "hotel specialist" in system:
+            return self._once(
+                messages,
+                "sk_hotels_search",
+                {"city": "Lisbon", "checkin": "2027-03-15", "checkout": "2027-03-18"},
+                "**Cancellation policy**\n**Booking link**\n**Neighborhood**\n**Nightly rate**",
+            )
+        if "you are a travel agent" in system:
+            return self._once(
+                messages,
+                "search-flight",
+                {"departureDate": "15/03/2027", "returnDate": "18/03/2027"},
+                "One flight. The price is left out on purpose.",
+            )
+        if "restaurant specialist" in system or "bar and nightlife" in system:
+            return AIMessage(content="No places were returned.\nVENUES: (none)")
+        return AIMessage(content="Offline specialist returned no structured data.")
+
+    def _bad_plan(self, messages, names, user):
+        called = agent._called_tools(messages)
+        destination = agent._infer_destination(user)
+        order = [
+            "update_state",
+            "search_flights",
+            "search_hotels",
+            "suggest_rental_cars",
+            "suggest_restaurants",
+            "suggest_bars",
+        ]
+        for name in order:
+            if name not in names or name in called:
+                continue
+            if name == "update_state":
+                args = {
+                    "origin": agent._infer_origin(user),
+                    "destination": destination,
+                    "guest_count": agent._infer_guests(user),
+                    "genre": "city break",
+                }
+            else:
+                args = {"request": user or f"Plan the trip to {destination}."}
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": name, "args": args, "id": f"call_{name}", "type": "tool_call"}],
+            )
+        return AIMessage(
+            content=(
+                "Trip plan for Lisbon\n\n"
+                "Flights\n"
+                "- SFO to LIS https://kiwi.com/u/price1249\n\n"
+                "Hotels\n"
+                "**Cancellation policy**\n"
+                "**Booking link**\n\n"
+                "Rental Cars ():\n"
+                "- https://mcp.octotrip.app/rental-cars/r/peugeot-2008\n"
+                "- https://mcp.octotrip.app/rental-cars/r/polo\n"
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_graph_renders_cars_and_hotels_from_tool_payloads(monkeypatch):
+    monkeypatch.setenv("TRIP_PLANNER_FAKE_LLM", "1")
+    agent.clear_mcp_cache()
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "octotrip_lisbon.json").read_text())
+    fixture["results"] = list(fixture["results"]) + [
+        {
+            "name": "VW Polo",
+            "vendor": "Record",
+            "price": 36.90,
+            "currency": "EUR",
+            "category": "Economy",
+            "booking_url": "https://mcp.octotrip.app/rental-cars/r/polo",
+            "sipp": "EDMR",
+        },
+        {
+            "name": "Ferrari Roma",
+            "vendor": "Masterkings",
+            "price": 900,
+            "currency": "EUR",
+            "category": "Luxury",
+            "booking_url": "https://mcp.octotrip.app/rental-cars/r/ferrari",
+            "sipp": "LDAR",
+        },
+    ]
+    hotels_md = (Path(__file__).parent / "fixtures" / "skiplagged_lisbon_hotels.md").read_text()
+    flight = {
+        "currency": "EUR",
+        "itineraries": [
+            _kiwi_itinerary(1249, "https://kiwi.com/u/price1249", "2027-03-15", "2027-03-18", "2027-03-16")
+        ],
+    }
+
+    from langchain_core.tools import StructuredTool
+
+    async def search(location: str = "", pickup_date: str = "", dropoff_date: str = "", age: int = 30):
+        return fixture
+
+    async def sk_hotels_search(city: str, checkin: str, checkout: str, limit: int = 5):
+        return hotels_md
+
+    async def search_flight(departureDate: str = "", returnDate: str = ""):
+        return flight
+
+    async def fake_list(name):
+        if name == "cars":
+            return [StructuredTool.from_function(coroutine=search, name="search", description="OctoTrip search")]
+        if name == "hotels":
+            return [
+                StructuredTool.from_function(
+                    coroutine=sk_hotels_search, name="sk_hotels_search", description="Skiplagged hotels"
+                )
+            ]
+        if name == "kiwi":
+            return [
+                StructuredTool.from_function(
+                    coroutine=search_flight, name="search-flight", description="Kiwi flights"
+                )
+            ]
+        raise ConnectionError(name)
+
+    monkeypatch.setattr(agent, "list_server_tools", fake_list)
+    monkeypatch.setattr(agent, "FakeTripModel", UnparseablePlanModel)
+    try:
+        planner = agent.build_graph()
+        final = await planner.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Plan 3 days in Lisbon from SFO for 2 people, "
+                            "outbound 15 March 2027 and return 18 March 2027."
+                        ),
+                    }
+                ]
+            },
+            config={"recursion_limit": 40},
+        )
+    finally:
+        agent.clear_mcp_cache()
+    text = agent.final_text(final)
+    expected = {
+        "VW Polo": ("36.90", "Record", "https://mcp.octotrip.app/rental-cars/r/polo"),
+        "Peugeot 2008": ("49.40", "CRC Car Rental Company", "https://mcp.octotrip.app/rental-cars/r/peugeot-2008"),
+        "Peugeot 308": ("49.51", "CRC Car Rental Company", "https://mcp.octotrip.app/rental-cars/r/peugeot-308"),
+        "Mercedes-Benz A-Class": ("95.88", "Masterkings", "https://mcp.octotrip.app/rental-cars/r/a-class"),
+        "BMW 1 Series": ("107.74", "Autounion", "https://mcp.octotrip.app/rental-cars/r/bmw-1"),
+    }
+    for name, (price, vendor, link) in expected.items():
+        assert name in text
+        assert price in text
+        assert vendor in text
+        assert link in text
+    assert "Ferrari Roma" not in text
+    assert "Rental Cars ():" not in text
+    assert "Rental Cars in Lisbon Airport (2027-03-15 to 2027-03-18):" in text
+    assert "Inn Rossio Hotel" in text
+    assert "Hotel ibis Lisboa Jose Malhoa" in text
+    assert "Hotels in Lisbon (2027-03-15 to 2027-03-18):" in text
+    assert "Hotels returned by the hotel specialist" not in text
+    for label in ("Cancellation policy", "Booking link", "Neighborhood", "Nightly rate"):
+        assert label not in text
+    assert "1249 EUR" in text
+    assert "https://kiwi.com/u/price1249" in text
+    assert "assumed driver age 30 — tell me yours if different" in text
