@@ -2461,9 +2461,10 @@ def _line_mentions_flight_number(line: str, numbers: set[str]) -> bool:
 def _line_restates_itinerary(line: str, urls: set[str], numbers: set[str]) -> bool:
     """A restatement pairs a rendered flight number with a price or booking link.
 
-    A day-plan bullet that only names the flight (``- Day 1: Fly TP238 overnight``)
-    is the itinerary, not a second copy of the Kiwi block.
+    A day-plan bullet that names the flight is the itinerary, not a second copy.
     """
+    if _DAY_LINE.search(line):
+        return False
     if any(url and url in line for url in urls):
         return True
     if not _line_mentions_flight_number(line, numbers):
@@ -3030,25 +3031,8 @@ def _is_prose_sentence(text: str) -> bool:
     return cleaned.rstrip().endswith((".", "!", "?"))
 
 
-def _section_kind(line: str) -> str | None:
-    raw = line.strip()
-    # The car intro can lead with the assumed age, so it does not start with "Rental".
-    if re.search(r"assumed driver age\s*30", raw, re.I) and re.search(r"\brental cars?\b", raw, re.I):
-        return "cars"
-    stripped = re.sub(r"^[#>*\-\s]+", "", raw).strip()
-    bare = re.sub(r"[*_`]", "", stripped).strip()
-    if not _marked_heading(raw) and _is_prose_sentence(bare):
-        return None
-    match = re.match(
-        r"(flights?|hotels?|rental cars?|car rental|restaurants?|dining|bars?)\b",
-        stripped,
-        re.I,
-    )
-    if not match:
-        return None
-    if len(stripped) > 90 and not stripped.endswith(":"):
-        return None
-    word = match.group(1).lower()
+def _kind_from_section_word(word: str) -> str | None:
+    word = word.lower()
     if word.startswith("flight"):
         return "flights"
     if word.startswith("hotel"):
@@ -3062,10 +3046,61 @@ def _section_kind(line: str) -> str | None:
     return None
 
 
+def _section_kind(line: str) -> str | None:
+    raw = line.strip()
+    # The car intro can lead with the assumed age, so it does not start with "Rental".
+    if re.search(r"assumed driver age\s*30", raw, re.I) and re.search(r"\brental cars?\b", raw, re.I):
+        return "cars"
+    # A bullet is an offer or a tip, not a section heading. ``- Hotel Avenida Palace``
+    # used to match ``hotels?`` after the marker was stripped.
+    if _list_item_body(raw) is not None and not raw.lstrip().startswith("#"):
+        return None
+    # A bold line is a section heading only when its whole text is the section
+    # title (``**Hotels**``, ``**Hotels in St. Augustine**``). ``**Hotel Two**`` is a name.
+    wrapped = re.fullmatch(r"\*\*(.+)\*\*", raw)
+    if wrapped:
+        inner = wrapped.group(1).strip()
+        if _is_prose_sentence(inner):
+            return None
+        title = inner.rstrip(":").strip()
+        match = re.match(
+            r"(flights|hotels|rental cars?|car rental|restaurants?|dining|bars?)\b",
+            title,
+            re.I,
+        )
+        if not match or len(title) > 90:
+            return None
+        return _kind_from_section_word(match.group(1))
+    stripped = re.sub(r"^[#>*\-\s]+", "", raw).strip()
+    bare = re.sub(r"[*_`]", "", stripped).strip()
+    if not _marked_heading(raw) and _is_prose_sentence(bare):
+        return None
+    match = re.match(
+        r"(flights?|hotels?|rental cars?|car rental|restaurants?|dining|bars?)\b",
+        stripped,
+        re.I,
+    )
+    if not match:
+        return None
+    if len(stripped) > 90 and not stripped.endswith(":"):
+        return None
+    return _kind_from_section_word(match.group(1))
+
+
 def _label_only_line(line: str) -> bool:
     cleaned = re.sub(r"[*_`#]", "", line)
     cleaned = re.sub(r"^[\-\d.)\s]+", "", cleaned).strip().strip(":").casefold()
     return bool(cleaned) and cleaned in HOTEL_FIELD_LABELS
+
+
+def _old_list_line(line: str) -> bool:
+    """A bullet or bold line in the old list, other than a day plan or a labelled alternate."""
+    stripped = line.strip()
+    if not stripped or _DAY_LINE.search(stripped) or _labelled_alternate_flight(line):
+        return False
+    if _list_item_body(line) is not None:
+        return True
+    return re.fullmatch(r"\*\*.+\*\*", stripped) is not None
 
 
 def _skippable_section_line(kind: str, line: str) -> bool:
@@ -3100,6 +3135,7 @@ def replace_named_section(answer: str, kind: str, new_section: str) -> str:
     lines = (answer or "").splitlines()
     out: list[str] = []
     skipping = False
+    in_old_list = False
     inserted = False
     for line in lines:
         if _section_kind(line) == kind:
@@ -3107,6 +3143,23 @@ def replace_named_section(answer: str, kind: str, new_section: str) -> str:
                 out.extend(new_section.splitlines())
                 inserted = True
             skipping = True
+            in_old_list = kind in {"hotels", "flights"}
+            continue
+        if skipping and in_old_list:
+            other = _section_kind(line)
+            if other and other != kind:
+                in_old_list = False
+                skipping = False
+                out.append(line)
+                continue
+            if not line.strip():
+                in_old_list = False
+                skipping = False
+                out.append(line)
+                continue
+            if _old_list_line(line):
+                continue
+            out.append(line)
             continue
         if skipping and _skippable_section_line(kind, line):
             continue
@@ -3189,11 +3242,31 @@ _FLIGHT_DESIGNATOR = re.compile(r"\b[A-Z]{1,3}\d{2,4}\b")
 
 
 def _line_names_structured_hotel(line: str, names: list[str]) -> bool:
-    """The line is a copy of a hotel already stored on the hotel record."""
-    plain = re.sub(r"[*_`#]", "", line).strip()
-    plain = re.sub(r"^(?:[-*•]|\d+[.)])\s+", "", plain).strip()
-    folded = plain.casefold()
-    return any(name and folded.startswith(name.casefold()) for name in names)
+    """A list or bold line that is a stored hotel name, not a sentence about it."""
+    if not names:
+        return False
+    bold = re.fullmatch(r"\*\*(.+)\*\*", line.strip())
+    if bold:
+        text = bold.group(1).strip()
+    else:
+        text = _list_item_body(line)
+        if text is None:
+            return False
+    if _is_prose_sentence(text):
+        return False
+    folded = text.strip().rstrip(".,;!").casefold()
+    for name in names:
+        hotel = name.casefold()
+        if not hotel:
+            continue
+        if folded == hotel:
+            return True
+        if re.match(
+            rf"{re.escape(hotel)}(?![0-9a-z])\s*(?:[:|(]|[\u2014\u2013-])",
+            folded,
+        ):
+            return True
+    return False
 
 
 def _record_fare_tokens(record: dict[str, Any]) -> set[str]:
@@ -3212,17 +3285,28 @@ def _record_fare_tokens(record: dict[str, Any]) -> set[str]:
 
 
 def _line_matches_structured_flight(line: str, numbers: set[str], fares: set[str]) -> bool:
-    """A copy of a stored flight number or fare, or an offer heading that names a flight."""
+    """A list item or bold offer that repeats a stored flight, not prose that mentions it."""
     if _labelled_alternate_flight(line) or _DAY_LINE.search(line) or _GROUND_LEG.search(line):
         return False
-    if _line_mentions_flight_number(line, numbers):
-        return True
-    if any(fare and re.search(rf"\b{re.escape(fare)}\b", line) for fare in fares):
-        return True
-    if not _FLIGHT_DESIGNATOR.search(line):
+    plain = re.sub(r"[*_`]", "", line).strip()
+    prose_source = _list_item_body(line) or plain
+    if _is_prose_sentence(prose_source):
         return False
-    stripped = line.strip()
-    if re.fullmatch(r"\*\*.+\*\*", stripped) or re.match(r"\d+[.)]\s+\S", stripped):
+    is_bold = re.fullmatch(r"\*\*.+\*\*", line.strip()) is not None
+    is_numbered = re.match(r"\s*\d+[.)]\s+\S", line) is not None
+    # A bold or numbered offer heading that carries its own flight designator.
+    if _FLIGHT_DESIGNATOR.search(line) and (is_bold or is_numbered):
+        return True
+    if _list_item_body(line) is None and not is_bold:
+        return False
+    has_number = _line_mentions_flight_number(line, numbers)
+    has_kiwi = "kiwi.com" in line.lower()
+    has_price_or_link = bool(_FLIGHT_PRICE.search(line) or re.search(r"https?://", line))
+    if has_number and has_price_or_link:
+        return True
+    if (has_number or has_kiwi) and any(
+        fare and re.search(rf"\b{re.escape(fare)}\b", line) for fare in fares
+    ):
         return True
     return False
 
@@ -3247,12 +3331,8 @@ def _drop_structured_repeats(lines: list[str], matches) -> list[str]:
 
 
 def _line_restates_hotel(line: str, names: list[str]) -> bool:
-    """A list item whose text starts with a hotel already in the rendered block."""
-    body = _list_item_body(line)
-    if body is None or not names:
-        return False
-    folded = body.casefold()
-    return any(folded.startswith(name.casefold()) for name in names)
+    """A list or bold line that repeats a hotel already in the rendered block."""
+    return _line_names_structured_hotel(line, names)
 
 
 def _under_named_heading(lines: list[str], kind: str) -> list[str]:

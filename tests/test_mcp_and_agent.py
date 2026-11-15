@@ -2135,7 +2135,7 @@ def test_headings_with_abbreviation_periods_still_replace_the_section():
         )
         text = agent.apply_coordinator_checks(answer, messages)
         assert heading not in text
-        assert "Old Capitol Hotel" in text
+        assert "Old Capitol Hotel" not in text
         assert text.count("Memmo Alfama") == 2
         assert "- Day 1: Land, check in at Memmo Alfama, walk the hill." in text
         assert "Hotel check-in is at 3 PM." in text
@@ -2166,7 +2166,7 @@ def test_flight_and_car_headings_with_periods_are_replaced():
         ],
     )
     assert "### Flights from Washington, D.C." not in flight_text
-    assert "stale listing without a link" in flight_text
+    assert "stale listing without a link" not in flight_text
     assert rendered.splitlines()[0] in flight_text
     assert "https://kiwi.com/default-sort" in flight_text
 
@@ -2219,7 +2219,6 @@ def test_replaced_flight_heading_drops_generic_stale_bullets():
         "### Flights from Washington, D.C.\n"
         "- stale listing without a link\n"
         "* another stale offer\n"
-        "- TAP TP238 — 320 EUR\n"
         "- Day 1: Fly TP238 overnight.\n"
         "Meet at the airport.\n",
         [
@@ -2230,9 +2229,8 @@ def test_replaced_flight_heading_drops_generic_stale_bullets():
             )
         ],
     )
-    assert "stale listing without a link" in text
-    assert "another stale offer" in text
-    assert "TAP TP238 — 320 EUR" not in text
+    assert "stale listing without a link" not in text
+    assert "another stale offer" not in text
     assert "- Day 1: Fly TP238 overnight." in text
     assert "Meet at the airport." in text
     assert rendered.splitlines()[0] in text
@@ -2496,7 +2494,7 @@ def test_bold_checkin_sentence_is_not_a_hotel_heading():
         ],
     )
     assert "**Hotel check-in is at 3 PM.**" in text
-    assert "Old Capitol Hotel" in text
+    assert "Old Capitol Hotel" not in text
     assert "Memmo Alfama" in text
 
 
@@ -2631,7 +2629,7 @@ def test_bold_checkin_after_hotel_list_survives_the_blank_line():
             )
         ],
     )
-    assert "Old Capitol Hotel" in text
+    assert "Old Capitol Hotel" not in text
     assert "**Hotel check-in is at 3 PM.**" in text
     assert "Memmo Alfama" in text
 
@@ -2727,26 +2725,15 @@ def test_upstream_in_a_no_results_message_is_not_an_outage():
 
 
 def test_skipped_section_does_not_leave_a_double_blank():
-    record = {
-        "outbound_date": "2027-03-15",
-        "return_date": "2027-03-18",
-        "itineraries": [
-            {
-                "price": "320",
-                "currency": "EUR",
-                "booking_url": "https://kiwi.com/x",
-                "legs": ["LIS -> OPO TAP TP238"],
-            }
-        ],
-    }
-    text = agent.replace_flight_section(
-        "Intro.\n\n\nFlights:\n- TAP TP238 — 320 EUR\n\n\nEnjoy the city.\n",
-        record,
+    text = agent.replace_named_section(
+        "Intro.\n\n\nFlights:\n- old listing\n\n\nEnjoy the city.\n",
+        "flights",
+        "Flights (2027-03-15 to 2027-03-18):\n- 320 EUR | https://kiwi.com/x",
     )
     assert "\n\n\n" not in text
     assert "Enjoy the city." in text
-    assert "TAP TP238 — 320 EUR" not in text
-    assert "https://kiwi.com/x" in text
+    assert "old listing" not in text
+    assert "Flights (2027-03-15 to 2027-03-18):" in text
 
 
 def test_blank_fare_renders_price_unavailable():
