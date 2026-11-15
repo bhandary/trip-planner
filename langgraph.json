@@ -1,0 +1,10 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "trip_planner": "./agent.py:graph"
+  },
+  "env": ".env",
+  "http": {
+    "app": "./http_app.py:app"
+  }
+}
