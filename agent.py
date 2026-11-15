@@ -10,6 +10,7 @@ server's tools plus Tavily ``web_search``.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import re
@@ -19,7 +20,7 @@ from typing import Any, Awaitable, Callable, NamedTuple
 
 from dotenv import load_dotenv
 from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import after_model, wrap_tool_call
+from langchain.agents.middleware import after_model, before_model, wrap_tool_call
 from langchain.chat_models import init_chat_model
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from langchain.tools import ToolRuntime, tool
@@ -34,6 +35,16 @@ from pydantic import Field
 from typing_extensions import NotRequired
 
 load_dotenv()
+
+# Tool tasks often do not share the caller's context, and a large OctoTrip
+# payload can be truncated before a trailer marker is stored on the ToolMessage.
+# The parsed record is kept here for the specialist return and the final post-check.
+_CAPTURE: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "trip_planner_capture", default=None
+)
+_RUN_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar("trip_planner_run", default=None)
+_RUNS: dict[str, dict[str, Any]] = {}
+_LATEST: dict[str, Any] = {}
 
 RETRYABLE_MCP_CODES = {-32603}
 DEFAULT_MODEL = "openai:gpt-4.1-mini"
@@ -109,10 +120,77 @@ def mcp_targets() -> dict[str, Any]:
     return targets
 
 
+def clear_capture() -> None:
+    _LATEST.clear()
+    _RUNS.clear()
+    _CAPTURE.set(None)
+    _RUN_ID.set(None)
+
+
 def clear_mcp_cache() -> None:
     global _specialists
     _tool_cache.clear()
     _specialists = None
+    clear_capture()
+
+
+def begin_capture(*, reset: bool = False) -> dict[str, Any]:
+    """One mutable record bag for this run. Tool tasks mutate it; they do not replace it."""
+    current = _CAPTURE.get()
+    run_id = _RUN_ID.get()
+    if reset:
+        run_id = uuid.uuid4().hex
+        current = {"cars": None, "hotels": None}
+        _RUN_ID.set(run_id)
+        _CAPTURE.set(current)
+        _RUNS.clear()
+        _RUNS[run_id] = current
+        _LATEST.clear()
+        return current
+    if current is not None and run_id is not None:
+        return current
+    # A tool task that did not inherit the caller bag must not wipe the other kind.
+    run_id = run_id or uuid.uuid4().hex
+    current = {"cars": None, "hotels": None}
+    _RUN_ID.set(run_id)
+    _CAPTURE.set(current)
+    _RUNS[run_id] = current
+    return current
+
+
+def stash_record(kind: str, record: dict[str, Any]) -> None:
+    box = _CAPTURE.get()
+    run_id = _RUN_ID.get()
+    if box is None or run_id is None:
+        box = begin_capture()
+        run_id = _RUN_ID.get()
+    box[kind] = record
+    if run_id:
+        _RUNS.setdefault(run_id, box)[kind] = record
+    _LATEST[kind] = record
+
+
+def stashed_record(kind: str) -> dict[str, Any] | None:
+    box = _CAPTURE.get()
+    if isinstance(box, dict) and isinstance(box.get(kind), dict) and box[kind].get("offers" if kind == "cars" else "hotels"):
+        return box[kind]
+    run_id = _RUN_ID.get()
+    shared = _RUNS.get(run_id or "", {})
+    if isinstance(shared, dict) and isinstance(shared.get(kind), dict):
+        record = shared[kind]
+        if record.get("offers" if kind == "cars" else "hotels"):
+            return record
+    latest = _LATEST.get(kind)
+    if isinstance(latest, dict) and latest.get("offers" if kind == "cars" else "hotels"):
+        return latest
+    return None
+
+
+def _open_capture(state: dict[str, Any], runtime: Any) -> None:
+    """Start a fresh bag before the first model call. Later calls keep tool captures."""
+    messages = state.get("messages") or []
+    seen_tool = any(getattr(message, "type", None) == "tool" or isinstance(message, ToolMessage) for message in messages)
+    begin_capture(reset=not seen_tool)
 
 
 def _lock() -> asyncio.Lock:
@@ -634,8 +712,9 @@ tools already answered the question.
 Do not put trip dates into places or web search queries.
 Name a venue only when a places tool returned it as a place, or when a Tavily
 result has a clearly named venue heading or entry. Never use a person, byline,
-or photo credit as a bar. If places and web search both have no venue data,
-say the source is unavailable and name nothing.
+or photo credit as a bar. Do not recommend pub crawls, walking tours, bus
+tours, or other activities that are not a bar. If places and web search both
+have no venue data, say the source is unavailable and name nothing.
 
 Work from the location and time window in the task. Match the type of
 venue to what was asked (cocktail bar, brewery or taproom, wine bar, rooftop,
@@ -2058,16 +2137,29 @@ def car_record_from_payload(payload: Any, args: dict[str, Any] | None = None) ->
 
 
 def seal_car_tool_result(result: Any, args: dict[str, Any] | None = None) -> str:
-    """Turn a raw car-tool return into text plus a structured record. Prose is not parsed."""
+    """Stash the OctoTrip record and lead with it. A trailer after the raw dump gets cut off."""
     payload = result[0] if isinstance(result, tuple) and result else result
     record = car_record_from_payload(payload, args)
+    if not record or not record.get("offers"):
+        if isinstance(payload, (dict, list)):
+            return json.dumps(payload)
+        return _message_text(payload)
+    stash_record("cars", record)
+    return format_structured("CARS", record) + "\n" + render_car_section(record)
+
+
+def seal_hotel_tool_result(result: Any, args: dict[str, Any] | None = None) -> str:
+    """Stash Skiplagged rows and lead with the record, the same way cars do."""
+    payload = result[0] if isinstance(result, tuple) and result else result
     if isinstance(payload, (dict, list)):
-        body = json.dumps(payload)
+        text = json.dumps(payload)
     else:
-        body = _message_text(payload)
-    if record:
-        body = body.rstrip() + "\n" + format_structured("CARS", record)
-    return body
+        text = _message_text(payload)
+    record = hotel_record_from_payload(text, args)
+    if not record or not record.get("hotels"):
+        return text
+    stash_record("hotels", record)
+    return format_structured("HOTELS", record) + "\n" + render_hotel_section(record)
 
 
 def _price_key(offer: dict[str, Any]) -> float:
@@ -2077,8 +2169,15 @@ def _price_key(offer: dict[str, Any]) -> float:
         return 1e18
 
 
+def _usable_date(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not re.search(r"\d", text):
+        return ""
+    return text
+
+
 def _when_span(start: str, end: str) -> str:
-    start, end = start.strip(), end.strip()
+    start, end = _usable_date(start), _usable_date(end)
     if start and end:
         return f" ({start} to {end})"
     if start or end:
@@ -2219,7 +2318,9 @@ def _skippable_section_line(kind: str, line: str) -> bool:
     if _label_only_line(line):
         return True
     if kind == "cars" and (
-        stripped.startswith(("-", "*", "•")) or re.search(r"https?://", stripped)
+        stripped.startswith(("-", "*", "•"))
+        or re.search(r"https?://", stripped)
+        or re.fullmatch(r"[\s():]*", stripped)
     ):
         return True
     if kind == "hotels" and (stripped.startswith(("-", "*", "•")) or stripped.startswith("**")):
@@ -2266,10 +2367,22 @@ def replace_car_section(answer: str, record: dict[str, Any]) -> str:
             in_section = True
         if not in_section and any(url and url in line for url in urls):
             continue
-        if re.search(r"Rental Cars\s*\(\s*\)", line, re.I):
+        if _empty_car_heading(line):
             continue
         kept.append(line)
     return "\n".join(kept).strip()
+
+
+def _empty_car_heading(line: str) -> bool:
+    """Drop 'Rental Cars in Lisbon (' and a following '):' with no dates."""
+    stripped = line.strip()
+    if re.fullmatch(r"[\s():]*", stripped):
+        return True
+    if not re.search(r"rental cars?\b", stripped, re.I):
+        return False
+    if re.search(r"\d", stripped):
+        return False
+    return bool(re.search(r"\(\s*\)", stripped) or re.search(r"\(\s*$", stripped))
 
 
 def replace_hotel_section(answer: str, record: dict[str, Any]) -> str:
@@ -2467,6 +2580,84 @@ def enforce_assumed_driver_age(answer: str, messages: list[Any], car_text: str) 
     return (body.rstrip() + "\n\n" + ASSUMED_DRIVER_AGE).strip()
 
 
+_NOT_BAR = re.compile(
+    r"\b(pub crawls?|bar crawls?|walking tours?|food tours?|city tours?|bike tours?|bus tours?|tuk-?tuks?|free tours?|sightseeing tours?)\b",
+    re.I,
+)
+
+
+def is_bar_venue(name: str) -> bool:
+    return bool(name) and _NOT_BAR.search(name) is None
+
+
+def _toolish(message: Any) -> bool:
+    return isinstance(message, ToolMessage) or getattr(message, "type", None) == "tool"
+
+
+def _message_payload_text(message: Any) -> str:
+    parts = [_message_text(getattr(message, "content", ""))]
+    artifact = getattr(message, "artifact", None)
+    if isinstance(artifact, (dict, list)):
+        parts.append(json.dumps(artifact, default=str))
+    elif artifact not in (None, ""):
+        parts.append(_message_text(artifact))
+    return "\n".join(part for part in parts if part)
+
+
+def car_record_from_messages(messages: list[Any]) -> dict[str, Any] | None:
+    """Read a car record from every tool message, including content the model never wrote."""
+    text = "\n".join(_message_payload_text(item) for item in messages or [] if _toolish(item))
+    record = read_structured(text, "CARS")
+    if record and record.get("offers"):
+        return record
+    parsed = car_record_from_payload(text, {})
+    if parsed and parsed.get("offers"):
+        return parsed
+    return None
+
+
+def hotel_record_from_messages(messages: list[Any]) -> dict[str, Any] | None:
+    text = "\n".join(_message_payload_text(item) for item in messages or [] if _toolish(item))
+    record = read_structured(text, "HOTELS")
+    if record and record.get("hotels"):
+        return record
+    parsed = hotel_record_from_payload(text, {})
+    if parsed and parsed.get("hotels"):
+        return parsed
+    return None
+
+
+def active_car_record(messages: list[Any], *, allow_stash: bool = False) -> dict[str, Any] | None:
+    found = car_record_from_messages(messages)
+    if found and found.get("offers"):
+        return found
+    called = allow_stash or bool(_tool_blob(messages, "suggest_rental_cars").strip())
+    if not called:
+        return None
+    return stashed_record("cars")
+
+
+def active_hotel_record(messages: list[Any], *, allow_stash: bool = False) -> dict[str, Any] | None:
+    found = hotel_record_from_messages(messages)
+    if found and found.get("hotels"):
+        return found
+    called = allow_stash or bool(_tool_blob(messages, "search_hotels").strip())
+    if not called:
+        return None
+    return stashed_record("hotels")
+
+
+def _drop_named_lines(answer: str, names: set[str]) -> str:
+    if not names:
+        return answer
+    kept = [
+        line
+        for line in (answer or "").splitlines()
+        if not any(name.casefold() in line.casefold() for name in names)
+    ]
+    return "\n".join(kept).strip()
+
+
 def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
     """Drop ungrounded venues, unconfirmed hours, mixed flight fields, and lost hotels."""
     restaurants = _tool_blob(messages, "suggest_restaurants")
@@ -2477,16 +2668,22 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
     allowed: set[str] = set()
     explicit_none = False
     dining_called = bool(restaurants.strip() or bars.strip())
-    for blob in (restaurants, bars):
+    excluded_bars: set[str] = set()
+    for blob, bar_blob in ((restaurants, False), (bars, True)):
         parsed = parse_venues_line(blob)
-        if parsed is None:
-            allowed |= extract_grounded_venues(blob)
-        else:
-            if not parsed:
+        names = extract_grounded_venues(blob) if parsed is None else parsed
+        if bar_blob:
+            excluded_bars |= {name for name in names if not is_bar_venue(name)}
+            names = {name for name in names if is_bar_venue(name)}
+            if parsed is not None and not parsed:
                 explicit_none = True
-            allowed |= parsed
+        elif parsed is not None and not parsed:
+            explicit_none = True
+        allowed |= names
     hotel_names = extract_hotel_names(hotels)
     before = answer
+    if excluded_bars:
+        answer = _drop_named_lines(answer, excluded_bars)
     if dining_called:
         answer = drop_ungrounded_claims(answer, allowed, hotel_names)
         dropped = answer != before
@@ -2494,10 +2691,10 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
         answer = scrub_overclaims(answer, restaurants + "\n" + bars, allowed)
         if dropped and (explicit_none or not allowed) and "unavailable" not in answer.lower():
             answer = answer.rstrip() + "\n\n" + VENUE_UNAVAILABLE
-    hotel_record = read_structured(hotels, "HOTELS")
+    hotel_record = active_hotel_record(messages)
     if hotel_record:
         answer = replace_hotel_section(answer, hotel_record)
-    car_record = read_structured(cars, "CARS")
+    car_record = active_car_record(messages)
     if car_record:
         answer = replace_car_section(answer, car_record)
     answer = enforce_assumed_driver_age(answer, messages, cars)
@@ -2526,6 +2723,7 @@ def coordinator_postcheck(state: dict[str, Any], runtime: Any) -> dict[str, Any]
 
 
 coordinator_postcheck_middleware = after_model(coordinator_postcheck)
+capture_middleware = before_model(_open_capture)
 
 
 def _seal_tool_text(tool: BaseTool, content: Any, artifact: Any, sealed: str) -> Any:
@@ -2559,14 +2757,7 @@ def attach_hotel_capture(tool: BaseTool) -> BaseTool:
     async def wrapped(**kwargs: Any) -> Any:
         value = await original(**kwargs)
         content, artifact = value if isinstance(value, tuple) and len(value) == 2 else (value, None)
-        if isinstance(content, (dict, list)):
-            text = json.dumps(content)
-        else:
-            text = _message_text(content)
-        record = hotel_record_from_payload(text, kwargs)
-        if record:
-            text = text.rstrip() + "\n" + format_structured("HOTELS", record)
-        return _seal_tool_text(tool, content, artifact, text)
+        return _seal_tool_text(tool, content, artifact, seal_hotel_tool_result(content, kwargs))
 
     tool.coroutine = wrapped
     setattr(tool, "_trip_hotel_capture", True)
@@ -2621,6 +2812,7 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
             f"Trip type: {state.get('genre') or 'unspecified'}. "
             f"Task: {request or 'Use the trip details above.'}"
         )
+        begin_capture()
         result = await agent.ainvoke(
             {"messages": [HumanMessage(content=message)]},
             config={"recursion_limit": 40},
@@ -2631,10 +2823,7 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
                 return locked
         if key == "rental_car":
             messages = result.get("messages") or []
-            evidence = "\n".join(
-                _message_text(item.content) for item in messages if isinstance(item, ToolMessage)
-            )
-            record = read_structured(evidence, "CARS")
+            record = active_car_record(messages, allow_stash=True)
             user_text = _human_text(list(state.get("messages") or []))
             note = driver_age_note(stated_driver_age(user_text))
             if record:
@@ -2649,18 +2838,17 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
             return (final_text(result).rstrip() + "\n" + note).strip()
         if key == "hotel":
             messages = result.get("messages") or []
-            evidence = "\n".join(
-                _message_text(item.content) for item in messages if isinstance(item, ToolMessage)
-            )
-            record = read_structured(evidence, "HOTELS")
+            record = active_hotel_record(messages, allow_stash=True)
             if record:
                 return render_hotel_section(record) + "\n" + format_structured("HOTELS", record)
             return final_text(result)
         if key in {"restaurant", "bar"}:
             messages = result.get("messages") or []
-            tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
-            evidence = "\n".join(_message_text(item.content) for item in tool_messages)
+            tool_messages = [item for item in messages if _toolish(item)]
+            evidence = "\n".join(_message_payload_text(item) for item in tool_messages)
             allowed = extract_grounded_venues(evidence)
+            if key == "bar":
+                allowed = {name for name in allowed if is_bar_venue(name)}
             return render_grounded_specialist(
                 final_text(result),
                 allowed,
@@ -2813,7 +3001,7 @@ def build_graph():
         tools=COORDINATOR_TOOLS,
         system_prompt=COORDINATOR_PROMPT,
         state_schema=TripState,
-        middleware=[coordinator_postcheck_middleware],
+        middleware=[capture_middleware, coordinator_postcheck_middleware],
         name="trip_planner",
     )
 

@@ -1164,10 +1164,10 @@ class UnparseablePlanModel(agent.FakeTripModel):
                 "search",
                 {
                     "location": "Lisbon Airport",
-                    "pickup_date": "2027-03-15",
-                    "dropoff_date": "2027-03-18",
+                    "pickup_date": "2027-03-12",
+                    "dropoff_date": "2027-03-15",
                 },
-                "Rental Cars ():\nnothing named here",
+                "Rental Cars in Lisbon (\n\n):\nnothing named here",
             )
         if "hotel specialist" in system:
             return self._once(
@@ -1222,9 +1222,7 @@ class UnparseablePlanModel(agent.FakeTripModel):
                 "Hotels\n"
                 "**Cancellation policy**\n"
                 "**Booking link**\n\n"
-                "Rental Cars ():\n"
-                "- https://mcp.octotrip.app/rental-cars/r/peugeot-2008\n"
-                "- https://mcp.octotrip.app/rental-cars/r/polo\n"
+                "Rental Cars in Lisbon (\n\n):\n"
             )
         )
 
@@ -1234,7 +1232,17 @@ async def test_graph_renders_cars_and_hotels_from_tool_payloads(monkeypatch):
     monkeypatch.setenv("TRIP_PLANNER_FAKE_LLM", "1")
     agent.clear_mcp_cache()
     fixture = json.loads((Path(__file__).parent / "fixtures" / "octotrip_lisbon.json").read_text())
-    fixture["results"] = list(fixture["results"]) + [
+    fixture["results"] = [
+        {
+            "name": "Fiat 500",
+            "vendor": "Autounion",
+            "price": 34.98,
+            "currency": "EUR",
+            "category": "Economy",
+            "booking_url": "https://mcp.octotrip.app/rental-cars/r/fiat-500",
+            "sipp": "EDMR",
+        },
+        *fixture["results"],
         {
             "name": "VW Polo",
             "vendor": "Record",
@@ -1292,6 +1300,22 @@ async def test_graph_renders_cars_and_hotels_from_tool_payloads(monkeypatch):
 
     monkeypatch.setattr(agent, "list_server_tools", fake_list)
     monkeypatch.setattr(agent, "FakeTripModel", UnparseablePlanModel)
+    # The live failure: the tool wrapper captured the record, then the specialist
+    # ToolMessage never contained <<<STRUCTURED_CARS>>>. Only the out-of-band stash
+    # (or a scan of a payload that is not on that message) can fill the plan.
+    real_cars = agent.seal_car_tool_result
+    real_hotels = agent.seal_hotel_tool_result
+
+    def seal_cars_without_marker(result, args=None):
+        real_cars(result, args)
+        return "OctoTrip rows were not copied onto this tool message."
+
+    def seal_hotels_without_marker(result, args=None):
+        real_hotels(result, args)
+        return "Skiplagged rows were not copied onto this tool message."
+
+    monkeypatch.setattr(agent, "seal_car_tool_result", seal_cars_without_marker)
+    monkeypatch.setattr(agent, "seal_hotel_tool_result", seal_hotels_without_marker)
     try:
         planner = agent.build_graph()
         final = await planner.ainvoke(
@@ -1312,11 +1336,11 @@ async def test_graph_renders_cars_and_hotels_from_tool_payloads(monkeypatch):
         agent.clear_mcp_cache()
     text = agent.final_text(final)
     expected = {
+        "Fiat 500": ("34.98", "Autounion", "https://mcp.octotrip.app/rental-cars/r/fiat-500"),
         "VW Polo": ("36.90", "Record", "https://mcp.octotrip.app/rental-cars/r/polo"),
         "Peugeot 2008": ("49.40", "CRC Car Rental Company", "https://mcp.octotrip.app/rental-cars/r/peugeot-2008"),
         "Peugeot 308": ("49.51", "CRC Car Rental Company", "https://mcp.octotrip.app/rental-cars/r/peugeot-308"),
         "Mercedes-Benz A-Class": ("95.88", "Masterkings", "https://mcp.octotrip.app/rental-cars/r/a-class"),
-        "BMW 1 Series": ("107.74", "Autounion", "https://mcp.octotrip.app/rental-cars/r/bmw-1"),
     }
     for name, (price, vendor, link) in expected.items():
         assert name in text
@@ -1324,8 +1348,11 @@ async def test_graph_renders_cars_and_hotels_from_tool_payloads(monkeypatch):
         assert vendor in text
         assert link in text
     assert "Ferrari Roma" not in text
+    assert "BMW 1 Series" not in text
     assert "Rental Cars ():" not in text
-    assert "Rental Cars in Lisbon Airport (2027-03-15 to 2027-03-18):" in text
+    assert "Rental Cars in Lisbon (\n" not in text
+    assert "\n):" not in text
+    assert "Rental Cars in Lisbon Airport (2027-03-12 to 2027-03-15):" in text
     assert "Inn Rossio Hotel" in text
     assert "Hotel ibis Lisboa Jose Malhoa" in text
     assert "Hotels in Lisbon (2027-03-15 to 2027-03-18):" in text
@@ -1335,3 +1362,61 @@ async def test_graph_renders_cars_and_hotels_from_tool_payloads(monkeypatch):
     assert "1249 EUR" in text
     assert "https://kiwi.com/u/price1249" in text
     assert "assumed driver age 30 — tell me yours if different" in text
+
+
+def test_blank_car_dates_do_not_render_empty_parens():
+    text = agent.render_car_section(
+        {
+            "pickup": "Lisbon",
+            "pickup_date": "\n\n",
+            "dropoff_date": " \n ",
+            "offers": [
+                {
+                    "name": "Fiat 500",
+                    "price": "34.98",
+                    "currency": "EUR",
+                    "vendor": "Autounion",
+                    "booking_url": "https://mcp.octotrip.app/rental-cars/r/fiat-500",
+                }
+            ],
+        }
+    )
+    assert "()" not in text
+    assert "(\n" not in text
+    assert text.startswith("Rental Cars in Lisbon:")
+    replaced = agent.replace_car_section(
+        "Rental Cars in Lisbon (\n\n):\n",
+        {
+            "pickup": "Lisbon Airport",
+            "pickup_date": "2027-03-12",
+            "dropoff_date": "2027-03-15",
+            "offers": [
+                {
+                    "name": "Fiat 500",
+                    "price": "34.98",
+                    "currency": "EUR",
+                    "vendor": "Autounion",
+                    "booking_url": "https://mcp.octotrip.app/rental-cars/r/fiat-500",
+                }
+            ],
+        },
+    )
+    assert "Rental Cars in Lisbon Airport (2027-03-12 to 2027-03-15):" in replaced
+    assert "Rental Cars in Lisbon (\n" not in replaced
+    assert "\n):" not in replaced
+
+
+def test_pub_crawl_is_dropped_from_bar_picks():
+    evidence = (
+        "**The Lisbon Pub Crawl**\n"
+        "**Park Bar**\n"
+        "VENUES: The Lisbon Pub Crawl | Park Bar"
+    )
+    text = agent.apply_coordinator_checks(
+        "Night one\n**The Lisbon Pub Crawl**\n**Park Bar**",
+        [ToolMessage(evidence, name="suggest_bars", tool_call_id="bars")],
+    )
+    assert "Pub Crawl" not in text
+    assert "Park Bar" in text
+    assert not agent.is_bar_venue("The Lisbon Pub Crawl")
+    assert agent.is_bar_venue("Park Bar")
