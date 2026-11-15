@@ -1888,3 +1888,212 @@ def test_start_config_binds_port_and_documents_env():
     assert "NEXT_PUBLIC_API_URL" in ui_example
     assert "langgraph dev" in readme
     assert "langgraph up" in readme
+
+
+def test_day_plan_hotel_lines_stay_and_a_restated_list_does_not():
+    record = {
+        "city": "Lisbon",
+        "checkin": "2027-03-15",
+        "checkout": "2027-03-18",
+        "hotels": [
+            {"name": "Memmo Alfama", "nightly": "€200", "total": "€600", "link": "https://skiplagged.com/hotel/memmo"},
+            {"name": "Lisboa", "nightly": "€150", "total": "€450", "link": "https://skiplagged.com/hotel/lisboa"},
+        ],
+    }
+    rendered = agent.render_hotel_section(record)
+    answer = (
+        "- Day 1: Land, check in at Memmo Alfama, walk the hill.\n"
+        "- Day 2: Tram 28 through Lisboa old town.\n"
+        "Hotel check-in is at 3 PM.\n"
+        "Hotels:\n"
+        "1. Memmo Alfama — central, €200\n"
+        "2. Lisboa — old town, €150\n"
+    )
+    text = agent.apply_coordinator_checks(
+        answer,
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("HOTELS", record),
+                name="search_hotels",
+                tool_call_id="hotels",
+            )
+        ],
+    )
+    assert "- Day 1: Land, check in at Memmo Alfama, walk the hill." in text
+    assert "- Day 2: Tram 28 through Lisboa old town." in text
+    assert "Hotel check-in is at 3 PM." in text
+    assert "1. Memmo Alfama" not in text
+    assert "2. Lisboa — old town" not in text
+    assert text.count("Memmo Alfama") == 2
+    assert rendered.splitlines()[0] in text
+
+
+def test_day_plan_flight_line_stays_and_a_priced_restatement_does_not():
+    record = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [_tap_round_trip(320, "https://kiwi.com/default-sort")],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    rendered = agent.render_flight_section(record)
+    answer = (
+        "- Day 1: Fly TP238 overnight, arrive 6 AM.\n"
+        "Flights:\n"
+        "1. TAP TP238 / TP237 — 320 EUR https://kiwi.com/default-sort\n"
+    )
+    text = agent.apply_coordinator_checks(
+        answer,
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("FLIGHTS", record),
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ],
+    )
+    assert "- Day 1: Fly TP238 overnight, arrive 6 AM." in text
+    assert "1. TAP TP238" not in text
+    assert text.count("https://kiwi.com/default-sort") == 1
+    assert "TP238" in text and "TP237" in text
+
+
+def _timed_hop(number: str, depart: str, arrive: str, origin: str, dest: str, carrier: str = "TAP") -> dict:
+    segment = {
+        "from": origin,
+        "to": dest,
+        "departureTime": depart,
+        "arrivalTime": arrive,
+        "carrierName": carrier,
+        "flightNumber": number,
+    }
+    return {**segment, "segments": [segment]}
+
+
+def test_flight_dedupe_keeps_times_and_spaced_flight_numbers():
+    def trip(out_number, out_depart, out_arrive, price, link, carrier="TAP"):
+        return {
+            "price": price,
+            "currency": "EUR",
+            "bookingUrl": link,
+            "outbound": _timed_hop(out_number, out_depart, out_arrive, "LIS", "OPO", carrier),
+            "inbound": _timed_hop("TP237", "2026-12-04 18:00", "2026-12-04 19:00", "OPO", "LIS"),
+        }
+
+    record = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2026-12-01", "returnDate": "2026-12-04"},
+                "currency": "EUR",
+                "itineraries": [
+                    trip("TP 238", "2026-12-01 08:00", "2026-12-01 09:00", 140, "https://kiwi.com/tp-late"),
+                    trip("TP238", "2026-12-01 08:00", "2026-12-01 09:00", 100, "https://kiwi.com/tp-cheap"),
+                    trip("TP 238", "2026-12-01 20:00", "2026-12-01 21:00", 90, "https://kiwi.com/tp-evening"),
+                    trip("U2 8123", "2026-12-01 11:00", "2026-12-01 12:00", 200, "https://kiwi.com/u2-dear", "easyJet"),
+                    trip("U28123", "2026-12-01 11:00", "2026-12-01 12:00", 150, "https://kiwi.com/u2-cheap", "easyJet"),
+                ],
+            }
+        ],
+        date(2026, 12, 1),
+        date(2026, 12, 4),
+    )
+    links = [item["booking_url"] for item in record["itineraries"]]
+    assert links == [
+        "https://kiwi.com/tp-evening",
+        "https://kiwi.com/tp-cheap",
+        "https://kiwi.com/u2-cheap",
+    ]
+    assert "https://kiwi.com/tp-late" not in links
+    assert "https://kiwi.com/u2-dear" not in links
+
+
+def test_fare_amount_blank_is_safe():
+    assert agent._fare_amount("") == float("inf")
+    assert agent._fare_amount(None) == float("inf")
+    assert agent._fare_amount("   ") == float("inf")
+    assert agent._fare_amount("320 EUR") == 320.0
+
+
+def test_recovered_flights_sort_by_total_not_outbound_price():
+    record = {
+        "outbound_date": "2027-03-15",
+        "return_date": "2027-03-18",
+        "itineraries": [
+            {
+                "price": "100",
+                "return_price": "500",
+                "currency": "EUR",
+                "booking_url": "https://kiwi.com/high-total",
+                "legs": [
+                    "LIS -> OPO depart 2027-03-15T08:00:00 arrive 2027-03-15T09:00:00 TAP TP100",
+                    "OPO -> LIS depart 2027-03-18T18:00:00 arrive 2027-03-18T19:00:00 TAP TP101",
+                ],
+                "has_return": True,
+            },
+            {
+                "price": "200",
+                "return_price": "50",
+                "currency": "EUR",
+                "booking_url": "https://kiwi.com/low-total",
+                "legs": [
+                    "LIS -> OPO depart 2027-03-15T12:00:00 arrive 2027-03-15T13:00:00 TAP TP200",
+                    "OPO -> LIS depart 2027-03-18T20:00:00 arrive 2027-03-18T21:00:00 TAP TP201",
+                ],
+                "has_return": True,
+            },
+        ],
+    }
+    recovered = agent.flight_record_from_messages(
+        [
+            ToolMessage(
+                agent.format_structured("FLIGHTS", record),
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ]
+    )
+    assert recovered is not None
+    assert [item["booking_url"] for item in recovered["itineraries"]] == [
+        "https://kiwi.com/low-total",
+        "https://kiwi.com/high-total",
+    ]
+
+
+def test_assumed_driver_age_car_intro_is_replaced_by_the_car_block():
+    offer = {
+        "results": [
+            {
+                "name": "Peugeot 2008",
+                "vendor": "CRC Car Rental Company",
+                "price": 49.4,
+                "currency": "EUR",
+                "booking_url": "https://cars.example/peugeot",
+                "category": "Compact",
+            }
+        ]
+    }
+    specialist = agent.seal_car_tool_result(
+        offer,
+        {
+            "location": "Lisbon Airport",
+            "pickup_date": "2027-03-15",
+            "dropoff_date": "2027-03-18",
+        },
+    )
+    answer = "- Assumed driver age 30. Here are top rental cars for the trip."
+    text = agent.apply_coordinator_checks(
+        answer,
+        [
+            HumanMessage(content="Plan Lisbon. No age was given."),
+            ToolMessage(specialist, name="suggest_rental_cars", tool_call_id="cars"),
+        ],
+    )
+    assert "- Assumed  Here are top rental cars" not in text
+    assert "Here are top rental cars" not in text
+    assert "Rental Cars in Lisbon Airport (2027-03-15 to 2027-03-18):" in text
+    assert "Peugeot 2008" in text
+    assert "assumed driver age 30 — tell me yours if different" in text

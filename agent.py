@@ -58,7 +58,6 @@ KIWI_URL = "https://mcp.kiwi.com"
 # JSON-RPC -32603, and retries only burn time.
 LASTMINUTE_URL = "https://mcp.lastminute.com/mcp"
 HOTELS_URL = "https://mcp.skiplagged.com/mcp"
-HOTELS_ALT_URL = LASTMINUTE_URL
 CARS_URL = "https://mcp.octotrip.app/rental-cars/mcp"
 CARS_ALT_URL = "https://www.upfront-rentals.com/MCP/Streamable"
 PLACES_URL = "https://mapstools.googleapis.com/mcp"
@@ -1046,11 +1045,10 @@ async def build_specialists(model: BaseChatModel | None = None) -> dict[str, Any
 
     Mirrors the requested wiring: one catalog, per-server tool lists, then
     ``create_agent(model, tools=server_tools + [web_search], system_prompt=...)``.
-    Skiplagged is the hotel source. lastminute.com is skipped. Upfront is the
+    Skiplagged is the hotel source. lastminute.com is not called. Upfront is the
     car fallback. Google Maps is registered only when ``GOOGLE_MAPS_KEY`` or
     ``GOOGLE_MAPS_API_KEY`` is set.
     """
-    warn_lastminute_once()
     flight_tools, flight_source, flight_errors = await load_with_fallback("kiwi")
     hotel_tools, hotel_source, hotel_errors = await load_with_fallback("hotels")
     car_tools, car_source, car_errors = await load_with_fallback("cars", "cars_alt")
@@ -2016,10 +2014,13 @@ def _return_departure(item: dict[str, Any]) -> date | None:
 
 
 def _fare_amount(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return float("inf")
     try:
-        return float(str(value or "").split()[0])
-    except ValueError:
-        return 1e18
+        return float(text.split()[0].replace(",", ""))
+    except (ValueError, IndexError):
+        return float("inf")
 
 
 def _normalize_itinerary(
@@ -2044,8 +2045,42 @@ def _normalize_itinerary(
     }
 
 
+def _flight_code(carrier: str, number: str) -> str:
+    """Carrier plus flight number, with spaces removed. ``TP 238`` and ``U2 8123`` collapse."""
+    number_compact = re.sub(r"[^A-Za-z0-9]", "", number or "").upper()
+    carrier_compact = re.sub(r"[^A-Za-z0-9]", "", carrier or "").upper()
+    if not number_compact:
+        return ""
+    if re.fullmatch(r"\d{2,4}", number_compact) and re.fullmatch(r"[A-Z0-9]{2}", carrier_compact):
+        return carrier_compact + number_compact
+    if re.search(r"\d", number_compact):
+        return number_compact
+    return ""
+
+
+def _flight_code_from_tail(tail: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9]+", tail or "")
+    if not tokens:
+        return ""
+    if (
+        len(tokens) >= 2
+        and re.fullmatch(r"\d{2,4}", tokens[-1])
+        and re.fullmatch(r"[A-Za-z0-9]{2}", tokens[-2])
+    ):
+        return _flight_code(tokens[-2], tokens[-1])
+    return _flight_code("", tokens[-1])
+
+
+def _leg_carrier_code(leg: dict[str, Any]) -> str:
+    for key in ("carrierCode", "airlineCode", "carrier"):
+        raw = str(leg.get(key) or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9]{2}", raw):
+            return raw
+    return ""
+
+
 def _leg_identity_from_dict(leg: dict[str, Any]) -> tuple[str, str, str] | None:
-    number = re.sub(r"\s+", "", str(leg.get("flightNumber") or "")).upper()
+    number = _flight_code(_leg_carrier_code(leg), str(leg.get("flightNumber") or ""))
     depart = str(
         leg.get("departureTime") or leg.get("local_departure") or leg.get("departure") or ""
     ).strip()
@@ -2055,13 +2090,21 @@ def _leg_identity_from_dict(leg: dict[str, Any]) -> tuple[str, str, str] | None:
     return (number, depart, arrive)
 
 
+_LEG_WHEN = r"(?:\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?|\d{2}:\d{2}(?::\d{2})?)"
+
+
 def _leg_identity_from_line(line: str) -> tuple[str, str, str] | None:
-    depart = re.search(r"depart\s+(\S+)", line)
-    arrive = re.search(r"arrive\s+(\S+)", line)
-    numbers = re.findall(r"\b([A-Z]{1,3}\d{2,4})\b", line)
-    if not numbers or not depart or not arrive:
+    match = re.search(
+        rf"depart\s+({_LEG_WHEN})\s+arrive\s+({_LEG_WHEN})(?:\s+(.*?))?\s*$",
+        line.strip(),
+        re.I,
+    )
+    if not match:
         return None
-    return (numbers[-1], depart.group(1), arrive.group(1))
+    number = _flight_code_from_tail(match.group(3) or "")
+    if not number:
+        return None
+    return (number, match.group(1), match.group(2))
 
 
 def itinerary_leg_key(item: dict[str, Any]) -> tuple[tuple[str, str, str], ...] | None:
@@ -2215,6 +2258,12 @@ def flight_record_from_messages(messages: list[Any]) -> dict[str, Any] | None:
     text = "\n".join(_message_payload_text(item) for item in messages or [] if _toolish(item))
     saved = read_structured(text, "FLIGHTS")
     if saved and saved.get("itineraries"):
+        items = dedupe_itineraries_by_legs(
+            [item for item in saved["itineraries"] if isinstance(item, dict)]
+        )
+        items.sort(key=_itinerary_total)
+        saved = dict(saved)
+        saved["itineraries"] = items[:3]
         return saved
     primary = text.split("ALTERNATE DATES")[0]
     itineraries: list[dict[str, Any]] = []
@@ -2251,7 +2300,7 @@ def flight_record_from_messages(messages: list[Any]) -> dict[str, Any] | None:
     if not itineraries:
         return None
     itineraries = dedupe_itineraries_by_legs(itineraries)
-    itineraries.sort(key=lambda item: _fare_amount(item.get("price")))
+    itineraries.sort(key=_itinerary_total)
     return {
         "outbound_date": outbound,
         "return_date": returning,
@@ -2289,13 +2338,27 @@ def _record_flight_numbers(record: dict[str, Any]) -> set[str]:
     return numbers
 
 
+_FLIGHT_PRICE = re.compile(
+    r"(?:[$€£]\s*\d|\b\d+(?:[.,]\d+)?\s*(?:EUR|USD|GBP)\b|\b(?:EUR|USD|GBP)\s*\d)",
+    re.I,
+)
+
+
+def _line_mentions_flight_number(line: str, numbers: set[str]) -> bool:
+    return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
+
+
 def _line_restates_itinerary(line: str, urls: set[str], numbers: set[str]) -> bool:
-    """A list line that repeats a rendered booking link or its flight numbers."""
+    """A restatement pairs a rendered flight number with a price or booking link.
+
+    A day-plan bullet that only names the flight (``- Day 1: Fly TP238 overnight``)
+    is the itinerary, not a second copy of the Kiwi block.
+    """
     if any(url and url in line for url in urls):
         return True
-    if not numbers or not re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+    if not _line_mentions_flight_number(line, numbers):
         return False
-    return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
+    return bool(_FLIGHT_PRICE.search(line) or re.search(r"https?://", line))
 
 
 def _split_around(text: str, section: str) -> tuple[list[str], list[str]] | None:
@@ -2326,15 +2389,19 @@ def replace_flight_section(answer: str, record: dict[str, Any]) -> str:
             return False
         return True
 
+    def outside(chunk: list[str]) -> list[str]:
+        return [line for line in _under_named_heading(chunk, "flights") if keep(line)]
+
     parts = _split_around(text, section)
     if parts is None:
         section_lines = set(section.splitlines())
-        lines = [line for line in text.splitlines() if line in section_lines or keep(line)]
+        body = [line for line in text.splitlines() if line not in section_lines]
+        lines = [*outside(body), *section.splitlines()]
         return scrub_false_no_return("\n".join(lines).strip(), record)
     before, after = parts
-    lines = [line for line in before if keep(line)]
+    lines = outside(before)
     lines.extend(section.splitlines())
-    lines.extend(line for line in after if keep(line))
+    lines.extend(outside(after))
     return scrub_false_no_return("\n".join(lines).strip(), record)
 
 
@@ -2780,8 +2847,26 @@ def render_hotel_section(record: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _is_section_heading(line: str) -> bool:
+    """A heading ends with ':' or starts with '#'. A sentence is not a heading."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return True
+    bare = re.sub(r"^[#>*\-\s]+", "", stripped)
+    bare = re.sub(r"[*_`]", "", bare).strip()
+    return bare.endswith(":")
+
+
 def _section_kind(line: str) -> str | None:
-    stripped = re.sub(r"^[#>*\-\s]+", "", line).strip()
+    raw = line.strip()
+    # The car intro can lead with the assumed age, so it does not start with "Rental".
+    if re.search(r"assumed driver age\s*30", raw, re.I) and re.search(r"\brental cars?\b", raw, re.I):
+        return "cars"
+    stripped = re.sub(r"^[#>*\-\s]+", "", raw).strip()
+    if re.search(r"[.!?]", stripped) and not stripped.endswith(":"):
+        return None
     match = re.match(
         r"(flights?|hotels?|rental cars?|car rental|restaurants?|dining|bars?)\b",
         stripped,
@@ -2899,17 +2984,39 @@ def _hotel_names(record: dict[str, Any]) -> list[str]:
     return names
 
 
+def _list_item_body(line: str) -> str | None:
+    match = re.match(r"^\s*(?:[-*•]|\d+[.)])\s+(.*)$", line)
+    if not match:
+        return None
+    return re.sub(r"[*_`]", "", match.group(1)).strip()
+
+
 def _line_restates_hotel(line: str, names: list[str]) -> bool:
-    """A numbered or bulleted line that names a hotel already in the rendered block."""
-    if not names:
+    """A list item whose text starts with a hotel already in the rendered block."""
+    body = _list_item_body(line)
+    if body is None or not names:
         return False
-    folded = line.casefold()
-    if not any(name.casefold() in folded for name in names):
-        return False
-    if re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
-        return True
-    bare = re.sub(r"[*_`]", "", line).strip()
-    return any(bare.casefold() == name.casefold() for name in names)
+    folded = body.casefold()
+    return any(folded.startswith(name.casefold()) for name in names)
+
+
+def _under_named_heading(lines: list[str], kind: str) -> list[str]:
+    """Drop a real heading of ``kind`` and the list that sits directly under it."""
+    kept: list[str] = []
+    under = False
+    for line in lines:
+        if _is_section_heading(line):
+            under = _section_kind(line) == kind
+            if under:
+                continue
+            kept.append(line)
+            continue
+        if under:
+            if not line.strip() or _list_item_body(line) is not None:
+                continue
+            under = False
+        kept.append(line)
+    return kept
 
 
 def replace_hotel_section(answer: str, record: dict[str, Any]) -> str:
@@ -2920,20 +3027,19 @@ def replace_hotel_section(answer: str, record: dict[str, Any]) -> str:
     def keep(line: str) -> bool:
         if _label_only_line(line):
             return False
-        if _section_kind(line) == "hotels":
-            return False
         if _line_restates_hotel(line, names):
             return False
         return True
 
     parts = _split_around(text, section)
     if parts is None:
-        kept = [line for line in text.splitlines() if keep(line) or line in section.splitlines()]
-        return "\n".join(kept).strip()
+        outside = [line for line in text.splitlines() if line not in section.splitlines()]
+        kept = [line for line in _under_named_heading(outside, "hotels") if keep(line)]
+        return "\n".join([*kept, *section.splitlines()]).strip()
     before, after = parts
-    lines = [line for line in before if keep(line)]
+    lines = [line for line in _under_named_heading(before, "hotels") if keep(line)]
     lines.extend(section.splitlines())
-    lines.extend(line for line in after if keep(line))
+    lines.extend(line for line in _under_named_heading(after, "hotels") if keep(line))
     return "\n".join(lines).strip()
 
 
