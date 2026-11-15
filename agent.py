@@ -1862,10 +1862,11 @@ def render_kiwi_itineraries(payload: Any, args: dict[str, Any] | None = None) ->
                 data = json.loads(data)
             except json.JSONDecodeError:
                 data = None
-        if isinstance(data, dict) and any(
-            key in data and not data.get(key) for key in ("itineraries", "flights", "results")
-        ):
-            return NO_FLIGHTS_FOUND
+        if isinstance(data, dict):
+            if data.get("error") or data.get("message"):
+                return FLIGHT_SOURCE_UNAVAILABLE
+            if any(key in data and not data.get(key) for key in ("itineraries", "flights", "results")):
+                return NO_FLIGHTS_FOUND
         return payload if isinstance(payload, str) else json.dumps(payload, default=str)
     envelope_currency = str(payload.get("currency") or "") if isinstance(payload, dict) else ""
     blocks: list[str] = []
@@ -2247,12 +2248,57 @@ def stash_flight_search(search: dict[str, Any]) -> None:
 
 
 NO_FLIGHTS_FOUND = "No flights found for these dates."
+FLIGHT_SOURCE_UNAVAILABLE = "The flight source is unavailable."
 
 
-def _reported_no_flights(text: str) -> bool:
-    if NO_FLIGHTS_FOUND in (text or ""):
+def _flight_result_texts(messages: list[Any]) -> list[str]:
+    return [
+        _message_text(message.content)
+        for message in messages or []
+        if isinstance(message, ToolMessage) and getattr(message, "name", None) == "search_flights"
+    ]
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    stripped = (text or "").strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _result_found_flights(text: str) -> bool:
+    """A search that names a fare, even when it is not a structured itinerary block."""
+    if "ITINERARY" in (text or "") and re.search(r"(?m)^(?:price|booking_link):", text):
         return True
-    return bool(re.search(r'"itineraries"\s*:\s*\[\s*\]', text or ""))
+    saved = read_structured(text or "", "FLIGHTS")
+    if saved and saved.get("itineraries"):
+        return True
+    if re.search(r"kiwi\.com", text or "", re.I):
+        return True
+    return bool(_FLIGHT_PRICE.search(text or "") and re.search(r"\b[A-Z]{1,3}\d{2,4}\b", text or ""))
+
+
+def _result_reports_no_flights(text: str) -> bool:
+    if _result_found_flights(text):
+        return False
+    data = _json_object(text)
+    if data is not None:
+        if data.get("error") or data.get("message"):
+            return False
+        return any(key in data and not data.get(key) for key in ("itineraries", "flights", "results"))
+    return NO_FLIGHTS_FOUND in (text or "")
+
+
+def _searches_found_no_flights(messages: list[Any]) -> bool:
+    """True only when no search returned a flight and the latest one came back empty."""
+    results = _flight_result_texts(messages)
+    if not results or any(_result_found_flights(item) for item in results):
+        return False
+    return _result_reports_no_flights(results[-1])
 
 
 def render_flight_section(record: dict[str, Any]) -> str:
@@ -2741,7 +2787,7 @@ def _looks_like_flight_payload(payload: Any) -> bool:
         joined = " ".join(cells)
         if "hotel" in joined or "night" in joined:
             return False
-        if any(word in joined for word in ("flight", "stops", "stop", "airline")):
+        if re.search(r"\b(?:flight|stops?|airline)\b", joined):
             return True
         return False
     return False
@@ -2928,7 +2974,10 @@ def _marked_heading(line: str) -> bool:
         return False
     if stripped.startswith("#") or stripped.endswith(":"):
         return True
-    return bool(re.fullmatch(r"\*\*.+\*\*", stripped))
+    wrapped = re.fullmatch(r"\*\*(.+)\*\*", stripped)
+    if not wrapped:
+        return False
+    return not _is_prose_sentence(wrapped.group(1).strip())
 
 
 def _is_prose_sentence(text: str) -> bool:
@@ -2946,7 +2995,8 @@ def _section_kind(line: str) -> str | None:
     if re.search(r"assumed driver age\s*30", raw, re.I) and re.search(r"\brental cars?\b", raw, re.I):
         return "cars"
     stripped = re.sub(r"^[#>*\-\s]+", "", raw).strip()
-    if not _marked_heading(raw) and _is_prose_sentence(stripped):
+    bare = re.sub(r"[*_`]", "", stripped).strip()
+    if not _marked_heading(raw) and _is_prose_sentence(bare):
         return None
     match = re.match(
         r"(flights?|hotels?|rental cars?|car rental|restaurants?|dining|bars?)\b",
@@ -3393,6 +3443,33 @@ def _drop_named_lines(answer: str, names: set[str]) -> str:
     return "\n".join(kept).strip()
 
 
+def _stale_flight_offer_line(line: str) -> bool:
+    """A leftover fare under an empty Flights heading: a Kiwi link, or a number beside a price."""
+    if re.search(r"kiwi\.com", line, re.I):
+        return True
+    return bool(_FLIGHT_PRICE.search(line) and re.search(r"\b[A-Z]{1,3}\d{2,4}\b", line))
+
+
+def _replace_empty_flight_section(answer: str) -> str:
+    """Say that nothing was found, and drop the priced lines that sat under the old heading."""
+    text = replace_named_section(answer, "flights", NO_FLIGHTS_FOUND)
+    if NO_FLIGHTS_FOUND not in text:
+        text = (text.rstrip() + "\n\n" + NO_FLIGHTS_FOUND).strip()
+    kept: list[str] = []
+    under = False
+    for line in text.splitlines():
+        if line.strip() == NO_FLIGHTS_FOUND:
+            under = True
+            kept.append(line)
+            continue
+        if under and _is_section_heading(line) and _section_kind(line) != "flights":
+            under = False
+        if under and _stale_flight_offer_line(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
     """Drop ungrounded venues, unconfirmed hours, mixed flight fields, and lost hotels."""
     restaurants = _tool_blob(messages, "suggest_restaurants")
@@ -3436,12 +3513,8 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
     flight_record = active_flight_record(messages)
     if flight_record and flight_record.get("itineraries"):
         answer = replace_flight_section(answer, flight_record)
-    elif _reported_no_flights(flights) or (
-        flight_record is not None and not flight_record.get("itineraries") and flights.strip()
-    ):
-        answer = replace_named_section(answer, "flights", NO_FLIGHTS_FOUND)
-        if NO_FLIGHTS_FOUND not in answer:
-            answer = (answer.rstrip() + "\n\n" + NO_FLIGHTS_FOUND).strip()
+    elif _searches_found_no_flights(messages):
+        answer = _replace_empty_flight_section(answer)
     else:
         answer = repair_flight_pairing(answer, flights)
         answer = separate_alternate_flights(answer, flights)

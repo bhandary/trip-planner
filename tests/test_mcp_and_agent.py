@@ -2325,3 +2325,78 @@ def test_zero_itineraries_say_no_flights_found():
     )
     assert text.strip() == "No flights found for these dates."
     assert "Flights:" not in text
+
+
+def test_later_flight_search_is_not_reported_as_empty():
+    answer = "Flights:\n- Retry found TAP TP238 for 320 EUR at https://kiwi.com/retry\n"
+    text = agent.apply_coordinator_checks(
+        answer,
+        [
+            ToolMessage("No flights found for these dates.", name="search_flights", tool_call_id="first"),
+            ToolMessage(
+                "Retry found TAP TP238 for 320 EUR. https://kiwi.com/retry",
+                name="search_flights",
+                tool_call_id="retry",
+            ),
+        ],
+    )
+    assert "No flights found for these dates." not in text
+    assert "TP238" in text
+    assert "https://kiwi.com/retry" in text
+    assert "Flights:" in text
+
+
+def test_empty_flight_search_drops_priced_lines_under_the_heading():
+    answer = (
+        "Flights:\n"
+        "- 320 EUR https://kiwi.com/default-sort\n"
+        "- TAP TP238 — 410 EUR\n"
+        "- Day 1: Fly TP238 overnight.\n"
+    )
+    text = agent.apply_coordinator_checks(
+        answer,
+        [ToolMessage("No flights found for these dates.", name="search_flights", tool_call_id="flights")],
+    )
+    assert "No flights found for these dates." in text
+    assert "https://kiwi.com/default-sort" not in text
+    assert "410 EUR" not in text
+    assert "- Day 1: Fly TP238 overnight." in text
+
+
+def test_flight_error_payload_is_unavailable_not_empty():
+    limited = agent.render_kiwi_itineraries({"results": None, "error": "rate limited"})
+    timed_out = agent.render_kiwi_itineraries({"itineraries": [], "error": "upstream timeout"})
+    assert limited == "The flight source is unavailable."
+    assert timed_out == "The flight source is unavailable."
+    assert "No flights found" not in limited
+    assert "No flights found" not in timed_out
+
+
+def test_bold_checkin_sentence_is_not_a_hotel_heading():
+    record = {
+        "city": "Lisbon",
+        "checkin": "2027-03-15",
+        "checkout": "2027-03-18",
+        "hotels": [
+            {
+                "name": "Memmo Alfama",
+                "nightly": "€200",
+                "total": "€600",
+                "link": "https://skiplagged.com/hotel/memmo",
+            }
+        ],
+    }
+    rendered = agent.render_hotel_section(record)
+    text = agent.apply_coordinator_checks(
+        "**Hotel check-in is at 3 PM.**\nHotels:\n- Old Capitol Hotel — €100\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("HOTELS", record),
+                name="search_hotels",
+                tool_call_id="hotels",
+            )
+        ],
+    )
+    assert "**Hotel check-in is at 3 PM.**" in text
+    assert "Old Capitol Hotel" not in text
+    assert "Memmo Alfama" in text
