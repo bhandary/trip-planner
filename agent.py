@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import logging
 import os
 import re
 import uuid
@@ -51,11 +52,19 @@ RETRYABLE_MCP_CODES = {-32603}
 DEFAULT_MODEL = "openai:gpt-4.1-mini"
 
 KIWI_URL = "https://mcp.kiwi.com"
-HOTELS_URL = "https://mcp.lastminute.com/mcp"
-HOTELS_ALT_URL = "https://mcp.skiplagged.com/mcp"
+# Skiplagged is the hotel source. lastminute.com's streamable-HTTP endpoint
+# (https://mcp.lastminute.com/mcp) answers list_tools with HTTP 403 from a
+# Cloudflare bot challenge. The MCP client turns that non-JSON body into
+# JSON-RPC -32603, and retries only burn time.
+LASTMINUTE_URL = "https://mcp.lastminute.com/mcp"
+HOTELS_URL = "https://mcp.skiplagged.com/mcp"
+HOTELS_ALT_URL = LASTMINUTE_URL
 CARS_URL = "https://mcp.octotrip.app/rental-cars/mcp"
 CARS_ALT_URL = "https://www.upfront-rentals.com/MCP/Streamable"
 PLACES_URL = "https://mapstools.googleapis.com/mcp"
+
+logger = logging.getLogger("trip_planner")
+_lastminute_warned = False
 
 _tool_cache: dict[str, list[BaseTool]] = {}
 _specialists: dict[str, Any] | None = None
@@ -105,7 +114,7 @@ def mcp_targets() -> dict[str, Any]:
     targets: dict[str, Any] = {
         "kiwi": KIWI_URL,
         "hotels": HOTELS_URL,
-        "hotels_alt": HOTELS_ALT_URL,
+        "lastminute": LASTMINUTE_URL,
         "cars": StreamableHttpTransport(
             CARS_URL,
             headers={"User-Agent": "Mozilla/5.0 (compatible; trip-planner/1.0)"},
@@ -247,6 +256,29 @@ def _retryable(exc: BaseException) -> bool:
     return code in RETRYABLE_MCP_CODES
 
 
+def warn_lastminute_once() -> None:
+    """Log the lastminute.com outage once per process. Do not retry it."""
+    global _lastminute_warned
+    if _lastminute_warned:
+        return
+    _lastminute_warned = True
+    logger.warning(
+        "lastminute.com MCP list_tools fails with JSON-RPC -32603 "
+        "(HTTP 403 Cloudflare bot challenge, not a retryable protocol error). "
+        "Using Skiplagged and not retrying."
+    )
+
+
+def _target_url(target: Any) -> str:
+    return str(getattr(target, "url", target) or "")
+
+
+def _is_lastminute_server(server_name: str) -> bool:
+    if server_name == "lastminute":
+        return True
+    return "lastminute.com" in _target_url(mcp_targets().get(server_name))
+
+
 async def call_with_retry(call: Callable[[], Awaitable[Any]]) -> Any:
     """Retry transient MCP failures. A definitive server error is not retried."""
     last: BaseException | None = None
@@ -271,6 +303,12 @@ async def list_server_tools(server_name: str) -> list[BaseTool]:
     """List tools for one server. Same role as ``get_tools(server_name=...)``."""
     if server_name in _tool_cache:
         return _tool_cache[server_name]
+    if _is_lastminute_server(server_name):
+        warn_lastminute_once()
+        raise MCPError(
+            -32603,
+            "lastminute.com MCP unavailable (Cloudflare challenge); not retrying",
+        )
     targets = mcp_targets()
     if server_name not in targets:
         raise KeyError(f"MCP server {server_name!r} is not configured")
@@ -615,7 +653,7 @@ You are not allowed to ask any more follow up questions, you must find the best 
 - Duration (shortest)
 - Date (time of year which you believe is best, unless the task already names dates)
 When the trip implies a return (a stay, a round trip, or an end date), search the outbound flight on the trip start date and the return flight on the trip end date. Search one-way only when the traveler asked for one-way. Do not search other date ranges. A result for different dates is an alternate: label it as different dates and do not present it as the trip. A return-direction flight on the trip end date is the inbound leg, not a missing return.
-Each Kiwi itinerary block is one result. Copy its price, legs, and booking link together. Never attach one itinerary's booking link or price to another itinerary's legs.
+Each Kiwi itinerary block is one result. Copy its price, legs, and booking link together. Never attach one itinerary's booking link or price to another itinerary's legs. Two searches that return the same flight numbers and departure and arrival times are one itinerary: keep the cheaper booking link and do not list it twice.
 If a block warns that arrival is a day or more after the trip start, or that the trip is mostly eaten by travel, repeat that warning. Show the currency Kiwi returned (for example EUR). Do not relabel it as dollars. If a return arrives on a later calendar day, label it next-day arrival.
 You may need to make multiple searches to iteratively find the best options.
 You will be given the origin and destination. It is your job to think critically about the best options.
@@ -1008,11 +1046,13 @@ async def build_specialists(model: BaseChatModel | None = None) -> dict[str, Any
 
     Mirrors the requested wiring: one catalog, per-server tool lists, then
     ``create_agent(model, tools=server_tools + [web_search], system_prompt=...)``.
-    Skiplagged and Upfront are fallbacks. Google Maps is registered only when
-    ``GOOGLE_MAPS_KEY`` or ``GOOGLE_MAPS_API_KEY`` is set.
+    Skiplagged is the hotel source. lastminute.com is skipped. Upfront is the
+    car fallback. Google Maps is registered only when ``GOOGLE_MAPS_KEY`` or
+    ``GOOGLE_MAPS_API_KEY`` is set.
     """
+    warn_lastminute_once()
     flight_tools, flight_source, flight_errors = await load_with_fallback("kiwi")
-    hotel_tools, hotel_source, hotel_errors = await load_with_fallback("hotels", "hotels_alt")
+    hotel_tools, hotel_source, hotel_errors = await load_with_fallback("hotels")
     car_tools, car_source, car_errors = await load_with_fallback("cars", "cars_alt")
     if "places" in mcp_targets():
         place_tools, place_source, place_errors = await load_with_fallback("places")
@@ -1025,8 +1065,6 @@ async def build_specialists(model: BaseChatModel | None = None) -> dict[str, Any
 
     flight_tools = [attach_flight_binding(item) for item in flight_tools]
     place_tools = [attach_date_strip(item) for item in place_tools]
-    if hotel_source == "hotels":
-        hotel_tools = [attach_call_fallback(item, "hotels_alt") for item in hotel_tools]
     hotel_tools = [attach_hotel_capture(item) for item in hotel_tools]
     if car_source == "cars":
         car_tools = [attach_call_fallback(item, "cars_alt") for item in car_tools]
@@ -2006,6 +2044,66 @@ def _normalize_itinerary(
     }
 
 
+def _leg_identity_from_dict(leg: dict[str, Any]) -> tuple[str, str, str] | None:
+    number = re.sub(r"\s+", "", str(leg.get("flightNumber") or "")).upper()
+    depart = str(
+        leg.get("departureTime") or leg.get("local_departure") or leg.get("departure") or ""
+    ).strip()
+    arrive = str(leg.get("arrivalTime") or leg.get("local_arrival") or leg.get("arrival") or "").strip()
+    if not number or not depart or not arrive:
+        return None
+    return (number, depart, arrive)
+
+
+def _leg_identity_from_line(line: str) -> tuple[str, str, str] | None:
+    depart = re.search(r"depart\s+(\S+)", line)
+    arrive = re.search(r"arrive\s+(\S+)", line)
+    numbers = re.findall(r"\b([A-Z]{1,3}\d{2,4})\b", line)
+    if not numbers or not depart or not arrive:
+        return None
+    return (numbers[-1], depart.group(1), arrive.group(1))
+
+
+def itinerary_leg_key(item: dict[str, Any]) -> tuple[tuple[str, str, str], ...] | None:
+    """Flight numbers plus departure and arrival times. Missing either means no key."""
+    legs = item.get("legs")
+    if isinstance(legs, list) and legs and all(isinstance(leg, str) for leg in legs):
+        keys = [_leg_identity_from_line(leg) for leg in legs]
+    else:
+        keys = [_leg_identity_from_dict(leg) for leg in _itinerary_legs(item)]
+    if not keys or any(key is None for key in keys):
+        return None
+    return tuple(keys)  # type: ignore[arg-type]
+
+
+def _itinerary_total(item: dict[str, Any]) -> float:
+    total = _fare_amount(item.get("price"))
+    if item.get("return_price"):
+        total += _fare_amount(item.get("return_price"))
+    return total
+
+
+def dedupe_itineraries_by_legs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse itineraries with the same legs. Keep the cheapest booking link."""
+    best_index: dict[tuple[tuple[str, str, str], ...], int] = {}
+    chosen: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = itinerary_leg_key(item)
+        if key is None:
+            chosen.append(item)
+            continue
+        index = best_index.get(key)
+        if index is None:
+            best_index[key] = len(chosen)
+            chosen.append(item)
+            continue
+        if _itinerary_total(item) < _itinerary_total(chosen[index]):
+            chosen[index] = item
+    return chosen
+
+
 def assemble_flight_record(
     searches: list[dict[str, Any]],
     start: date | None,
@@ -2036,7 +2134,7 @@ def assemble_flight_record(
                 outbound.append((item, args, currency))
     chosen: list[dict[str, Any]] = []
     if rounds:
-        chosen = sorted(rounds, key=lambda item: _fare_amount(item.get("price")))[:3]
+        chosen = sorted(dedupe_itineraries_by_legs(rounds), key=_itinerary_total)[:3]
     elif outbound and inbound and start and end:
         pairs: list[tuple[float, dict[str, Any]]] = []
         for out_item, out_args, out_currency in outbound:
@@ -2060,12 +2158,17 @@ def assemble_flight_record(
                     )
                 )
         pairs.sort(key=lambda item: item[0])
-        chosen = [item for _, item in pairs[:3]]
+        chosen = dedupe_itineraries_by_legs([item for _, item in pairs])[:3]
     elif outbound and not (start and end):
-        chosen = [
-            _normalize_itinerary(item, args, envelope_currency=currency, has_return=False)
-            for item, args, currency in outbound[:3]
-        ]
+        chosen = sorted(
+            dedupe_itineraries_by_legs(
+                [
+                    _normalize_itinerary(item, args, envelope_currency=currency, has_return=False)
+                    for item, args, currency in outbound
+                ]
+            ),
+            key=_itinerary_total,
+        )[:3]
     return {
         "outbound_date": start.isoformat() if start else "",
         "return_date": end.isoformat() if end else "",
@@ -2147,6 +2250,7 @@ def flight_record_from_messages(messages: list[Any]) -> dict[str, Any] | None:
         )
     if not itineraries:
         return None
+    itineraries = dedupe_itineraries_by_legs(itineraries)
     itineraries.sort(key=lambda item: _fare_amount(item.get("price")))
     return {
         "outbound_date": outbound,
@@ -2175,6 +2279,32 @@ def scrub_false_no_return(answer: str, record: dict[str, Any]) -> str:
     return _NO_RETURN.sub("", answer or "").strip()
 
 
+def _record_flight_numbers(record: dict[str, Any]) -> set[str]:
+    numbers: set[str] = set()
+    for item in record.get("itineraries") or []:
+        if not isinstance(item, dict):
+            continue
+        for leg in item.get("legs") or []:
+            numbers.update(re.findall(r"\b([A-Z]{1,3}\d{2,4})\b", str(leg)))
+    return numbers
+
+
+def _line_restates_itinerary(line: str, urls: set[str], numbers: set[str]) -> bool:
+    """A list line that repeats a rendered booking link or its flight numbers."""
+    if any(url and url in line for url in urls):
+        return True
+    if not numbers or not re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+        return False
+    return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
+
+
+def _split_around(text: str, section: str) -> tuple[list[str], list[str]] | None:
+    index = text.find(section)
+    if index < 0:
+        return None
+    return text[:index].splitlines(), text[index + len(section) :].splitlines()
+
+
 def replace_flight_section(answer: str, record: dict[str, Any]) -> str:
     section = render_flight_section(record)
     text = replace_named_section(answer, "flights", section)
@@ -2185,13 +2315,26 @@ def replace_flight_section(answer: str, record: dict[str, Any]) -> str:
         for key in ("booking_url", "return_url")
         if item.get(key)
     }
-    lines: list[str] = []
-    for line in text.splitlines():
+    numbers = _record_flight_numbers(record)
+
+    def keep(line: str) -> bool:
         links = [link.rstrip(".,)") for link in re.findall(r"https?://\S+", line)]
         flight_links = [link for link in links if "kiwi.com" in link]
         if flight_links and any(link not in kept for link in flight_links):
-            continue
-        lines.append(line)
+            return False
+        if _line_restates_itinerary(line, kept, numbers):
+            return False
+        return True
+
+    parts = _split_around(text, section)
+    if parts is None:
+        section_lines = set(section.splitlines())
+        lines = [line for line in text.splitlines() if line in section_lines or keep(line)]
+        return scrub_false_no_return("\n".join(lines).strip(), record)
+    before, after = parts
+    lines = [line for line in before if keep(line)]
+    lines.extend(section.splitlines())
+    lines.extend(line for line in after if keep(line))
     return scrub_false_no_return("\n".join(lines).strip(), record)
 
 
@@ -2745,19 +2888,53 @@ def _empty_car_heading(line: str) -> bool:
     return bool(re.search(r"\(\s*\)", stripped) or re.search(r"\(\s*$", stripped))
 
 
+def _hotel_names(record: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for hotel in record.get("hotels") or []:
+        if not isinstance(hotel, dict):
+            continue
+        name = str(hotel.get("name") or "").strip()
+        if name and not _is_hotel_label(name):
+            names.append(name)
+    return names
+
+
+def _line_restates_hotel(line: str, names: list[str]) -> bool:
+    """A numbered or bulleted line that names a hotel already in the rendered block."""
+    if not names:
+        return False
+    folded = line.casefold()
+    if not any(name.casefold() in folded for name in names):
+        return False
+    if re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+        return True
+    bare = re.sub(r"[*_`]", "", line).strip()
+    return any(bare.casefold() == name.casefold() for name in names)
+
+
 def replace_hotel_section(answer: str, record: dict[str, Any]) -> str:
     section = render_hotel_section(record)
     text = replace_named_section(answer, "hotels", section)
-    heading = section.splitlines()[0]
-    kept: list[str] = []
-    in_section = False
-    for line in text.splitlines():
-        if line == heading:
-            in_section = True
-        if not in_section and _label_only_line(line):
-            continue
-        kept.append(line)
-    return "\n".join(kept).strip()
+    names = _hotel_names(record)
+
+    def keep(line: str) -> bool:
+        if _label_only_line(line):
+            return False
+        if _section_kind(line) == "hotels":
+            return False
+        if _line_restates_hotel(line, names):
+            return False
+        return True
+
+    parts = _split_around(text, section)
+    if parts is None:
+        kept = [line for line in text.splitlines() if keep(line) or line in section.splitlines()]
+        return "\n".join(kept).strip()
+    before, after = parts
+    lines = [line for line in before if keep(line)]
+    lines.extend(section.splitlines())
+    lines.extend(line for line in after if keep(line))
+    return "\n".join(lines).strip()
 
 
 def separate_alternate_flights(answer: str, flight_text: str) -> str:
@@ -3251,13 +3428,13 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
 
 @tool
 async def search_flights(request: str, runtime: ToolRuntime) -> str:
-    """Ask the flight specialist for economy options. Pass origin, destination, and dates. Include a return date when the trip has one."""
+    """Ask the flight specialist for economy options. Pass origin, destination, and dates. Include a return date when the trip has one. The result is one rendered Flights block; do not restate an itinerary already in it."""
     return await _delegate("flight", request, runtime)
 
 
 @tool
 async def search_hotels(request: str, runtime: ToolRuntime) -> str:
-    """Ask the hotel specialist for lodging. Pass destination, dates, guests, rooms, and preferences in request."""
+    """Ask the hotel specialist for lodging. Pass destination, dates, guests, rooms, and preferences in request. The result is one rendered Hotels block; do not add a second list of those hotels."""
     return await _delegate("hotel", request, runtime)
 
 
@@ -3322,9 +3499,10 @@ First find origin, destination, guest count, and the kind of trip (genre). When 
 Then delegate with search_flights, search_hotels, suggest_rental_cars, suggest_restaurants, and suggest_bars. Independent specialists may be called in parallel; that is faster than waiting for one before the next. Pass each specialist a self-contained request with dates, party size, and preferences from the conversation.
 Use web_search only for gaps the specialists do not cover: events, attractions, travel advisories, and opening hours. Do not put trip dates into web search queries. Do not invent prices, venues, ratings, or hours.
 Keep every hotel the hotel specialist returned. Drop one only when you explain why. Hotel names are property names from the hotel tool. Do not list field labels such as Neighborhood, Nightly rate, Cancellation, or Tradeoff as hotels.
+The hotel specialist returns one rendered Hotels block. That block is the only hotel section. Do not append another list, numbered or bulleted, of hotels already in that block.
+For flights, the specialist returns one rendered Flights block. Do not restate an itinerary whose flight numbers and times are already in that block. Keep each itinerary you present (or the top 3) with its price, legs, and booking link. Show the currency Kiwi returned, such as EUR, and do not relabel it as dollars. If a return arrives on a later day, label it next-day arrival. Repeat a warning that arrival is late or that travel eats the trip.
 Name a restaurant or bar only when that specialist's tool output names it as a place. Drop photo credits, bylines, and any other name that is not a returned venue. When a specialist says the source is unavailable, repeat that and name no venues.
 Do not say hours or open status are confirmed for the trip dates unless a tool result states it. Otherwise say check hours before going. Do not relabel cuisine or move a place to a meal the source did not support.
-For flights, keep each itinerary you present (or the top 3) with its price, legs, and booking link. Show the currency Kiwi returned, such as EUR, and do not relabel it as dollars. If a return arrives on a later day, label it next-day arrival. Repeat a warning that arrival is late or that travel eats the trip.
 Do not invent a driver age. When the traveler did not give one, the car search uses 30 and the plan must say exactly: assumed driver age 30 — tell me yours if different. Keep each rental's name, price, vendor, and booking link.
 When the specialists have answered, combine their facts into one itinerary. Name any source that was unavailable. You plan and compare; you do not book.
 """.strip()

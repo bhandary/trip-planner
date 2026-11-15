@@ -6,8 +6,18 @@ A coordinator agent plans a trip and delegates to flight, hotel, rental car, res
 
 - Python 3.11+
 - Node 22 and pnpm 10 (for the UI)
-- `OPENAI_API_KEY` for a real hosted model. Without it, set `TRIP_PLANNER_FAKE_LLM=1` to run the same graph with an offline stand-in. Do not set that flag on Railway.
-- Optional: `TAVILY_API_KEY` for web search, and `GOOGLE_MAPS_KEY` (or `GOOGLE_MAPS_API_KEY`) for restaurant and bar places.
+
+### Required environment variables
+
+Copy `.env.example` to `.env`. Do not commit real keys.
+
+| Variable | Role |
+| --- | --- |
+| `OPENAI_API_KEY` | Hosted chat model. Required for a real plan. Without it, set `TRIP_PLANNER_FAKE_LLM=1` to run the same graph offline. Do not set that flag on Railway. |
+| `TAVILY_API_KEY` | Web search for gaps the MCP servers do not cover. |
+| `GOOGLE_MAPS_API_KEY` | Google Maps Grounding Lite for restaurants and bars. `GOOGLE_MAPS_KEY` is an accepted alias. |
+
+The process can boot and serve `GET /health` without these keys. A live trip plan needs all three.
 
 ```bash
 python3 -m venv .venv
@@ -53,15 +63,17 @@ make probe
 | Agent | Primary | Fallback |
 | --- | --- | --- |
 | Flights | [Kiwi](https://mcp.kiwi.com) | none |
-| Hotels | [lastminute.com](https://mcp.lastminute.com/mcp) | [Skiplagged](https://mcp.skiplagged.com/mcp) |
+| Hotels | [Skiplagged](https://mcp.skiplagged.com/mcp) | none (lastminute.com is not called) |
 | Rental cars | [OctoTrip](https://mcp.octotrip.app/rental-cars/mcp) | [Upfront Rentals](https://www.upfront-rentals.com/MCP/Streamable) |
 | Restaurants and bars | [Google Maps Grounding Lite](https://mapstools.googleapis.com/mcp) | none |
 
-Kiwi, lastminute.com, Skiplagged, OctoTrip, and Upfront Rentals are called with no API key. OctoTrip blocks the default HTTP client user agent, so the car agent sends `User-Agent: Mozilla/5.0 (compatible; trip-planner/1.0)`. Google Maps is added only when `GOOGLE_MAPS_KEY` or `GOOGLE_MAPS_API_KEY` is set, and the header is `X-Goog-Api-Key`. If that key is missing, the restaurant and bar agents skip Maps and say so.
+Kiwi, Skiplagged, OctoTrip, and Upfront Rentals are called with no API key. OctoTrip blocks the default HTTP client user agent, so the car agent sends `User-Agent: Mozilla/5.0 (compatible; trip-planner/1.0)`. Google Maps is added only when `GOOGLE_MAPS_KEY` or `GOOGLE_MAPS_API_KEY` is set, and the header is `X-Goog-Api-Key`. If that key is missing, the restaurant and bar agents skip Maps and say so.
+
+lastminute.com documents a streamable-HTTP server at `https://mcp.lastminute.com/mcp`. From this environment every probe (browser and client user agents, `Accept: application/json` and `Accept: application/json, text/event-stream`, GET and POST, `/mcp`, `/sse`, and `/`) returns HTTP 403 `cf-mitigated: challenge` HTML, with no `mcp-session-id`. The MCP streamable-HTTP client maps that non-JSON error to JSON-RPC `-32603` (`Server returned an error response`). Headers, Accept, transport, path, and session handling do not get past the Cloudflare challenge, so the hotel agent does not call lastminute.com and does not retry it. The process logs one warning.
 
 Tavily (`langchain-tavily`) is a general web search tool for gaps: events, attractions, advisories, hours, and fees. It is not a substitute for live MCP prices. Without `TAVILY_API_KEY` the tool returns an error payload instead of raising.
 
-If a primary server errors or times out, the hotel and car agents use the fallback server. If both fail, the specialist says the source is unavailable and does not crash the run.
+If the car server errors or times out, the car agent uses Upfront Rentals. If a source fails, the specialist says it is unavailable and does not crash the run.
 
 `langchain-mcp-adapters` is archived. Tool loading uses `langchain.mcp.MCPAdapter` (`list_tools` on one server), which replaces `MultiServerMCPClient.get_tools(server_name=...)`.
 
@@ -77,7 +89,8 @@ The backend is `langgraph dev` (`langgraph-cli[inmem]`). It speaks the Agent Ser
 - Config: `Dockerfile` and `railway.toml`
 - Listens on `0.0.0.0:$PORT`
 - Health check: `GET /health`
-- Variables: `OPENAI_API_KEY`, and any of `OPENAI_MODEL`, `TRIP_PLANNER_MODEL`, `TAVILY_API_KEY`, `GOOGLE_MAPS_KEY`, `MCP_TIMEOUT_SECONDS`. Leave `TRIP_PLANNER_FAKE_LLM` unset.
+- Start command: `sh scripts/start-backend.sh` (`Procfile` and `railway.toml`). It runs `langgraph dev --host 0.0.0.0 --port $PORT`.
+- Variables: `OPENAI_API_KEY`, `TAVILY_API_KEY`, and `GOOGLE_MAPS_API_KEY` (see above). Optional: `OPENAI_MODEL`, `TRIP_PLANNER_MODEL`, `GOOGLE_MAPS_KEY`, `MCP_TIMEOUT_SECONDS`. Leave `TRIP_PLANNER_FAKE_LLM` unset.
 
 Generate a public domain. The examples below assume the service is named `trip-planner`.
 

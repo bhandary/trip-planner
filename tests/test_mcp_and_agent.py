@@ -1,6 +1,8 @@
 import ast
 import asyncio
 import json
+import logging
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,9 +16,9 @@ from agent import (
     BAR_PROMPT,
     CARS_ALT_URL,
     CARS_URL,
-    HOTELS_ALT_URL,
     HOTELS_URL,
     KIWI_URL,
+    LASTMINUTE_URL,
     PLACES_URL,
     RENTAL_PROMPT,
     call_with_retry,
@@ -77,7 +79,9 @@ def test_places_omitted_without_key():
     assert "places" not in targets
     assert targets["kiwi"] == KIWI_URL
     assert targets["hotels"] == HOTELS_URL
-    assert targets["hotels_alt"] == HOTELS_ALT_URL
+    assert "skiplagged.com" in HOTELS_URL
+    assert targets["lastminute"] == LASTMINUTE_URL
+    assert "hotels_alt" not in targets
     assert str(targets["cars"].url) == CARS_URL
     assert "trip-planner" in targets["cars"].headers["User-Agent"]
     assert targets["cars_alt"] == CARS_ALT_URL
@@ -321,7 +325,7 @@ async def test_places_skipped_and_primaries_wired(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_hotel_fallback_server_is_used_when_primary_lists_fail(monkeypatch):
+async def test_hotel_source_does_not_retry_lastminute(monkeypatch):
     seen = []
 
     async def fake_list(name):
@@ -329,7 +333,7 @@ async def test_hotel_fallback_server_is_used_when_primary_lists_fail(monkeypatch
         from langchain_core.tools import StructuredTool
 
         if name == "hotels":
-            raise TimeoutError("lastminute down")
+            raise TimeoutError("skiplagged down")
 
         async def _run(**kwargs):
             return "ok"
@@ -338,7 +342,9 @@ async def test_hotel_fallback_server_is_used_when_primary_lists_fail(monkeypatch
 
     monkeypatch.setattr(agent, "list_server_tools", fake_list)
     await agent.build_specialists(model=agent.FakeTripModel())
-    assert "hotels" in seen and "hotels_alt" in seen
+    assert seen == ["kiwi", "hotels", "cars"]
+    assert "lastminute" not in seen
+    assert "hotels_alt" not in seen
 
 
 @pytest.mark.asyncio
@@ -1459,7 +1465,7 @@ def test_hotel_stash_renders_nightly_and_total_when_the_tool_message_does_not():
     assert "https://skiplagged.com/hotel/1" in text
 
 
-def _one_way_itinerary(origin, dest, day, price, link):
+def _one_way_itinerary(origin, dest, day, price, link, flight="TP123"):
     return {
         "price": price,
         "currency": "EUR",
@@ -1476,7 +1482,7 @@ def _one_way_itinerary(origin, dest, day, price, link):
                     "departureTime": f"{day}T08:00:00",
                     "arrivalTime": f"{day}T16:00:00",
                     "carrierName": "TAP",
-                    "flightNumber": "TP123",
+                    "flightNumber": flight,
                 }
             ],
         },
@@ -1601,7 +1607,9 @@ async def test_two_one_way_searches_become_the_12_to_15_itinerary(monkeypatch):
         return {
             "currency": "EUR",
             "itineraries": [
-                _one_way_itinerary("SFO", "LIS", "2027-03-12", price, f"https://kiwi.com/u/out{price}")
+                _one_way_itinerary(
+                    "SFO", "LIS", "2027-03-12", price, f"https://kiwi.com/u/out{price}", flight=f"TP{price}"
+                )
                 for price in (400, 500, 600, 900)
             ],
         }
@@ -1653,3 +1661,206 @@ async def test_missing_return_date_is_filled_and_rendered(monkeypatch):
     assert "SFO -> YUL depart 2027-03-12T08:25:00" in text
     assert "LIS -> SFO depart 2027-03-15T12:15:00" in text
     assert "no return flight" not in text.lower()
+
+
+def _tap_round_trip(price: float, link: str) -> dict:
+    return {
+        "price": price,
+        "currency": "EUR",
+        "bookingUrl": link,
+        "outbound": {
+            "from": "LIS",
+            "to": "OPO",
+            "departureTime": "2027-03-15T08:00:00",
+            "arrivalTime": "2027-03-15T09:05:00",
+            "segments": [
+                {
+                    "from": "LIS",
+                    "to": "OPO",
+                    "departureTime": "2027-03-15T08:00:00",
+                    "arrivalTime": "2027-03-15T09:05:00",
+                    "carrierName": "TAP",
+                    "flightNumber": "TP238",
+                }
+            ],
+        },
+        "inbound": {
+            "from": "OPO",
+            "to": "LIS",
+            "departureTime": "2027-03-18T19:10:00",
+            "arrivalTime": "2027-03-18T20:15:00",
+            "segments": [
+                {
+                    "from": "OPO",
+                    "to": "LIS",
+                    "departureTime": "2027-03-18T19:10:00",
+                    "arrivalTime": "2027-03-18T20:15:00",
+                    "carrierName": "TAP",
+                    "flightNumber": "TP237",
+                }
+            ],
+        },
+    }
+
+
+def test_same_flight_legs_keep_the_cheapest_link():
+    pricey = _tap_round_trip(510, "https://kiwi.com/duration-sort")
+    cheap = _tap_round_trip(320, "https://kiwi.com/default-sort")
+    other = _kiwi_itinerary(400, "https://kiwi.com/other", "2027-03-15", "2027-03-18")
+    record = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [pricey, other],
+                "currency": "EUR",
+            },
+            {
+                "args": {"sort": "duration", "departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [cheap],
+                "currency": "EUR",
+            },
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    tap = [item for item in record["itineraries"] if "TP238" in " ".join(item["legs"])]
+    assert len(tap) == 1
+    assert tap[0]["booking_url"] == "https://kiwi.com/default-sort"
+    assert "https://kiwi.com/duration-sort" not in str(record)
+    assert any(item["booking_url"] == "https://kiwi.com/other" for item in record["itineraries"])
+    assert "TP237" in " ".join(tap[0]["legs"])
+
+
+def test_coordinator_does_not_restate_a_rendered_itinerary():
+    record = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [_tap_round_trip(320, "https://kiwi.com/default-sort")],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    rendered = agent.render_flight_section(record)
+    answer = (
+        rendered
+        + "\n\n1. TAP TP238 / TP237 — 320 EUR https://kiwi.com/default-sort\n"
+        + "2. Same flights via the duration search: https://kiwi.com/duration-sort\n"
+    )
+    text = agent.apply_coordinator_checks(
+        answer,
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("FLIGHTS", record),
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ],
+    )
+    assert text.count("https://kiwi.com/default-sort") == 1
+    assert "https://kiwi.com/duration-sort" not in text
+    assert "\n1. TAP" not in text
+    assert "TP238" in text and "TP237" in text
+    assert rendered.splitlines()[0] in text
+
+
+def test_coordinator_keeps_only_the_rendered_hotel_block():
+    record = {
+        "city": "Lisbon",
+        "checkin": "2027-03-15",
+        "checkout": "2027-03-18",
+        "hotels": [
+            {
+                "name": "Inn Rossio Hotel",
+                "nightly": "€67",
+                "total": "€231",
+                "link": "https://skiplagged.com/hotel/1",
+            },
+            {
+                "name": "Hotel ibis Lisboa Jose Malhoa",
+                "nightly": "€47",
+                "total": "€174",
+                "link": "https://skiplagged.com/hotel/2",
+            },
+        ],
+    }
+    rendered = agent.render_hotel_section(record)
+    answer = (
+        rendered
+        + "\n\nHotels\n"
+        + "1. Inn Rossio Hotel — €67 per night, €231 total\n"
+        + "2. Hotel ibis Lisboa Jose Malhoa — €47 per night, €174 total\n"
+        + "Dinner nearby is separate."
+    )
+    text = agent.apply_coordinator_checks(
+        answer,
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("HOTELS", record),
+                name="search_hotels",
+                tool_call_id="hotels",
+            )
+        ],
+    )
+    assert text.count("Inn Rossio Hotel") == 1
+    assert text.count("Hotel ibis Lisboa Jose Malhoa") == 1
+    assert "\n1. " not in text
+    assert "\n2. " not in text
+    assert rendered.splitlines()[0] in text
+    assert "https://skiplagged.com/hotel/1" in text
+    assert "Dinner nearby is separate." in text
+
+
+@pytest.mark.asyncio
+async def test_lastminute_fails_fast_and_warns_once(monkeypatch, caplog):
+    agent._lastminute_warned = False
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(agent.asyncio, "sleep", fake_sleep)
+    constructed = {"n": 0}
+
+    class Adapter:
+        def __init__(self, target):
+            constructed["n"] += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def list_tools(self, cache_mode="bypass"):
+            raise AssertionError("lastminute must not open a retried MCP session")
+
+    monkeypatch.setattr("langchain.mcp.MCPAdapter", Adapter)
+    caplog.set_level(logging.WARNING, logger="trip_planner")
+    with pytest.raises(MCPError) as first:
+        await agent.list_server_tools("lastminute")
+    with pytest.raises(MCPError):
+        await agent.list_server_tools("lastminute")
+    assert first.value.code == -32603
+    assert constructed["n"] == 0
+    assert sleeps == []
+    warnings = [rec for rec in caplog.records if "lastminute" in rec.getMessage().casefold()]
+    assert len(warnings) == 1
+
+
+def test_start_config_binds_port_and_documents_env():
+    script = Path("scripts/start-backend.sh").read_text()
+    assert "--host 0.0.0.0" in script
+    assert 'PORT="${PORT:-2024}"' in script
+    assert '--port "$PORT"' in script
+    assert "start-backend.sh" in Path("Procfile").read_text()
+    railway = Path("railway.toml").read_text()
+    assert "start-backend.sh" in railway
+    assert "/health" in railway
+    readme = Path("README.md").read_text()
+    example = Path(".env.example").read_text()
+    for key in ("OPENAI_API_KEY", "TAVILY_API_KEY", "GOOGLE_MAPS_API_KEY"):
+        assert key in readme
+        assert key in example
