@@ -279,13 +279,23 @@ def _accepted_args(tool: BaseTool, raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def driver_age_note(age: Any) -> str:
-    """Use a stated age. Otherwise say the search assumed 30 and flag it."""
+    """Use a stated age. Otherwise say explicitly that 30 is an assumed age."""
     if age is None or str(age).strip() == "":
         return (
-            "No driver age was stated. Assumed age 30 for this search. "
-            "Prices may change for a different age."
+            "No driver age was stated. Assumed age 30. "
+            "30 is an assumed age for this search. Prices may change for a different age."
         )
     return f"Driver age {age} was taken from the request."
+
+
+def stated_driver_age(text: str) -> str | None:
+    match = re.search(r"\b(?:age|aged)\s+(\d{2})\b", text or "", re.I)
+    if match:
+        return match.group(1)
+    match = re.search(r"\b(\d{2})\s*(?:years?\s*old|-year-old)\b", text or "", re.I)
+    if match:
+        return match.group(1)
+    return None
 
 
 def airport_args_for(args: dict[str, Any]) -> dict[str, Any] | None:
@@ -497,7 +507,7 @@ You are not allowed to ask any more follow up questions, you must find the best 
 - Price (lowest, economy class)
 - Duration (shortest)
 - Date (time of year which you believe is best, unless the task already names dates)
-When the trip implies a return (a stay, a round trip, or an end date), search the outbound flight on the trip start date and the return flight on the trip end date. Search one-way only when the traveler asked for one-way.
+When the trip implies a return (a stay, a round trip, or an end date), search the outbound flight on the trip start date and the return flight on the trip end date. Search one-way only when the traveler asked for one-way. Do not search other date ranges. A result for different dates is an alternate: label it as different dates and do not present it as the trip.
 Each Kiwi itinerary block is one result. Copy its price, legs, and booking link together. Never attach one itinerary's booking link or price to another itinerary's legs.
 If a block warns that arrival is a day or more after the trip start, or that the trip is mostly eaten by travel, repeat that warning.
 You may need to make multiple searches to iteratively find the best options.
@@ -552,8 +562,8 @@ For a fly-in trip, default pickup and drop-off to the arrival airport unless the
 task names a different place. If a city search returns no_results, search that
 city's airport before giving up.
 Do not guess a driver age. If the task states an age, use that age. If it does
-not, the search assumes age 30: say that the age was assumed and that the price
-may change. Vehicle class, transmission, and budget are optional; apply them
+not, say that 30 is an assumed age and that the price may change. Keep each
+vehicle name and its price with the offer. Vehicle class, transmission, and budget are optional; apply them
 when given.
 
 Return 3 to 5 options, ranked by fit. For each one give: supplier, vehicle class,
@@ -1017,6 +1027,9 @@ def strip_trip_dates(text: str) -> str:
     return cleaned.strip(" ,;-")
 
 
+_MAPS_SUFFIX = re.compile(r"\s+-\s+Google Maps\s*$", re.I)
+
+
 def looks_like_venue_label(label: str) -> bool:
     label = re.sub(r"\s+", " ", label).strip(" .-*#")
     if not label or len(label) > 80:
@@ -1025,14 +1038,22 @@ def looks_like_venue_label(label: str) -> bool:
         return False
     if re.search(r"\b(best|top|guide|essential|ultimate|review|where to)\b", label, re.I):
         return False
+    if re.match(r"^(?:EUR(?:[_\s-]?\d+)?|€+|\$+)\b", label, re.I):
+        return False
+    if not re.search(r"[A-Za-z]", label):
+        return False
     words = label.split()
-    if not 1 <= len(words) <= 8:
+    if not 1 <= len(words) <= 14:
         return False
     if re.search(r"\b(restaurants|bars|nightlife|hotels)\b", label, re.I) and len(words) > 3:
         return False
     if not (label[0].isupper() or label[0].isdigit()):
         return False
     return True
+
+
+def _clean_place_title(title: str) -> str:
+    return _MAPS_SUFFIX.sub("", title).strip()
 
 
 def credit_names(text: str) -> set[str]:
@@ -1057,10 +1078,29 @@ def _heading_names(text: str) -> list[str]:
             r"(?m)^(?:name|venue|restaurant|bar)\s*:\s*(.+)$", scrubbed, re.I
         )
     )
+    # Grounding Lite summaries name venues as **Name** headings, not only markdown #.
+    found.extend(match.group(1).strip() for match in re.finditer(r"\*\*([^*]{2,80})\*\*", scrubbed))
     return found
 
 
+def _attribution_title(obj: dict[str, Any]) -> str | None:
+    """Grounding Lite stores the visible name at place.attribution.title."""
+    containers = [obj.get("place"), obj]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        attribution = container.get("attribution")
+        if isinstance(attribution, dict) and isinstance(attribution.get("title"), str):
+            title = _clean_place_title(attribution["title"])
+            if title:
+                return title
+    return None
+
+
 def _place_name(obj: dict[str, Any]) -> str | None:
+    titled = _attribution_title(obj)
+    if titled:
+        return titled
     if not any(key in obj for key in _PLACE_HINTS):
         return None
     display = obj.get("displayName") or obj.get("display_name")
@@ -1071,7 +1111,7 @@ def _place_name(obj: dict[str, Any]) -> str | None:
         return None
     if name.startswith("places/"):
         return display.strip() if isinstance(display, str) else None
-    return name.strip()
+    return _clean_place_title(name.strip())
 
 
 def _walk_place_names(node: Any) -> list[str]:
@@ -1081,7 +1121,7 @@ def _walk_place_names(node: Any) -> list[str]:
         if place:
             names.append(place)
         for key, value in node.items():
-            if key in {"content", "snippet", "raw_content"} and isinstance(value, str):
+            if key in {"content", "snippet", "raw_content", "summary"} and isinstance(value, str):
                 names.extend(_heading_names(value))
             else:
                 names.extend(_walk_place_names(value))
@@ -1303,14 +1343,88 @@ def ensure_hotels_kept(answer: str, names: list[str]) -> str:
     return answer.rstrip() + "\n\nHotels returned by the hotel specialist (kept):\n" + extra
 
 
+_MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+_MONTH_RE = (
+    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+)
+
+
 def _parse_date(value: Any) -> date | None:
-    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(value or ""))
-    if not match:
-        return None
-    try:
-        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-    except ValueError:
-        return None
+    text = str(value or "")
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            return None
+    match = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", text)
+    if match:
+        try:
+            return date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+        except ValueError:
+            return None
+    match = re.search(rf"\b{_MONTH_RE}\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?", text, re.I)
+    if match and match.group(3):
+        try:
+            return date(int(match.group(3)), _MONTHS[match.group(1)[:3].lower()], int(match.group(2)))
+        except ValueError:
+            return None
+    match = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{_MONTH_RE}(?:\s+(\d{{4}}))?", text, re.I)
+    if match and match.group(3):
+        try:
+            return date(int(match.group(3)), _MONTHS[match.group(2)[:3].lower()], int(match.group(1)))
+        except ValueError:
+            return None
+    return None
+
+
+def iter_dates(text: str) -> list[date]:
+    """Dates in reading order. ISO, dd/mm/yyyy, and named months with a year."""
+    found: list[tuple[int, date]] = []
+    patterns = (
+        r"\d{4}-\d{2}-\d{2}",
+        r"\b\d{1,2}/\d{1,2}/\d{4}\b",
+        rf"\b{_MONTH_RE}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})",
+        rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH_RE}(?:\s+\d{{4}})",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text or "", re.I):
+            parsed = _parse_date(match.group(0))
+            if parsed:
+                found.append((match.start(), parsed))
+    found.sort(key=lambda item: item[0])
+    ordered: list[date] = []
+    seen: set[date] = set()
+    for _, parsed in found:
+        if parsed not in seen:
+            seen.add(parsed)
+            ordered.append(parsed)
+    return ordered
+
+
+def requested_trip_dates(text: str) -> tuple[date | None, date | None]:
+    """Earliest and latest concrete dates in a trip request."""
+    dates = iter_dates(text)
+    if len(dates) >= 2:
+        ordered = sorted(dates)
+        return ordered[0], ordered[-1]
+    if len(dates) == 1:
+        return dates[0], None
+    return None, None
 
 
 def _looks_like_itinerary(node: dict[str, Any]) -> bool:
@@ -1366,41 +1480,94 @@ def _itinerary_link(node: dict[str, Any]) -> str:
     return ""
 
 
+def _segment_legs(direction: dict[str, Any]) -> list[dict[str, Any]]:
+    """Kiwi puts airport codes in route and the timed hops in segments."""
+    segments = direction.get("segments")
+    if isinstance(segments, list):
+        hops = [leg for leg in segments if isinstance(leg, dict)]
+        if hops:
+            return hops
+    if direction.get("from") or direction.get("flyFrom"):
+        return [direction]
+    return []
+
+
 def _itinerary_legs(node: dict[str, Any]) -> list[dict[str, Any]]:
-    for key in ("route", "legs", "segments"):
-        if isinstance(node.get(key), list):
-            return [leg for leg in node[key] if isinstance(leg, dict)]
     legs: list[dict[str, Any]] = []
-    for key in ("outbound", "return", "inbound"):
+    for key in ("outbound", "inbound", "return"):
+        part = node.get(key)
+        if isinstance(part, dict):
+            legs.extend(_segment_legs(part))
+        elif isinstance(part, list):
+            for item in part:
+                if isinstance(item, dict):
+                    legs.extend(_segment_legs(item))
+    if legs:
+        return legs
+    for key in ("segments", "legs", "route"):
         part = node.get(key)
         if isinstance(part, list):
-            legs.extend(leg for leg in part if isinstance(leg, dict))
-        elif isinstance(part, dict):
-            legs.append(part)
-    return legs
+            hops = [leg for leg in part if isinstance(leg, dict)]
+            if hops:
+                return hops
+    return []
 
 
 def _leg_line(leg: dict[str, Any]) -> str:
-    origin = leg.get("flyFrom") or leg.get("from") or leg.get("origin") or "?"
-    destination = leg.get("flyTo") or leg.get("to") or leg.get("destination") or "?"
-    depart = leg.get("local_departure") or leg.get("departure") or ""
-    arrive = leg.get("local_arrival") or leg.get("arrival") or ""
-    return f"{origin} -> {destination} depart {depart} arrive {arrive}".strip()
+    origin = leg.get("from") or leg.get("flyFrom") or leg.get("origin") or "?"
+    destination = leg.get("to") or leg.get("flyTo") or leg.get("destination") or "?"
+    depart = leg.get("departureTime") or leg.get("local_departure") or leg.get("departure") or ""
+    arrive = leg.get("arrivalTime") or leg.get("local_arrival") or leg.get("arrival") or ""
+    carrier = leg.get("carrierName") or leg.get("carrier") or ""
+    number = leg.get("flightNumber") or ""
+    flight = " ".join(part for part in (str(carrier), str(number)) if part)
+    line = f"{origin} -> {destination} depart {depart} arrive {arrive}"
+    if flight:
+        line += f" {flight}"
+    return line.strip()
 
 
-def _first_arrival(item: dict[str, Any]) -> date | None:
+def _outbound_arrival(item: dict[str, Any]) -> date | None:
+    """Arrival at the destination, not a connection and not the flight home."""
+    outbound = item.get("outbound")
+    if isinstance(outbound, dict):
+        parsed = _parse_date(
+            outbound.get("arrivalTime") or outbound.get("local_arrival") or outbound.get("arrival")
+        )
+        if parsed:
+            return parsed
     legs = _itinerary_legs(item)
     if not legs:
         return None
-    return _parse_date(legs[0].get("local_arrival") or legs[0].get("arrival"))
+    last = legs[-1]
+    return _parse_date(last.get("arrivalTime") or last.get("local_arrival") or last.get("arrival"))
+
+
+def _itinerary_search_dates(
+    item: dict[str, Any], args: dict[str, Any]
+) -> tuple[date | None, date | None]:
+    outbound = item.get("outbound") if isinstance(item.get("outbound"), dict) else {}
+    inbound = item.get("inbound") if isinstance(item.get("inbound"), dict) else {}
+    if not inbound and isinstance(item.get("return"), dict):
+        inbound = item["return"]
+    depart = _parse_date(outbound.get("departureTime") or outbound.get("local_departure")) or _parse_date(
+        args.get("departureDate") or args.get("departure_date") or args.get("date_from")
+    )
+    ret = _parse_date(inbound.get("departureTime") or inbound.get("local_departure")) or _parse_date(
+        args.get("returnDate") or args.get("return_date") or args.get("date_to")
+    )
+    return depart, ret
 
 
 def travel_eaten_warning(items: list[dict[str, Any]], args: dict[str, Any]) -> str | None:
     start = _parse_date(args.get("departureDate") or args.get("departure_date") or args.get("date_from"))
     end = _parse_date(args.get("returnDate") or args.get("return_date") or args.get("date_to"))
+    if items and start is None:
+        start, inferred_end = _itinerary_search_dates(items[0], {})
+        end = end or inferred_end
     notes: list[str] = []
     for item in items:
-        arrival = _first_arrival(item)
+        arrival = _outbound_arrival(item)
         if start and arrival and arrival >= start + timedelta(days=1):
             notes.append(
                 f"Arrival {arrival.isoformat()} is a day or more after the trip start "
@@ -1410,7 +1577,7 @@ def travel_eaten_warning(items: list[dict[str, Any]], args: dict[str, Any]) -> s
     if start and end:
         span = (end - start).days
         for item in items:
-            arrival = _first_arrival(item)
+            arrival = _outbound_arrival(item)
             if arrival is None:
                 continue
             ground = (end - arrival).days
@@ -1433,23 +1600,71 @@ def render_kiwi_itineraries(payload: Any, args: dict[str, Any] | None = None) ->
         price, currency = _itinerary_price(item)
         link = _itinerary_link(item)
         legs = "\n".join(f"  - {_leg_line(leg)}" for leg in _itinerary_legs(item)) or "  - (no legs)"
+        outbound_date, return_date = _itinerary_search_dates(item, args)
+        warning = travel_eaten_warning([item], args)
         blocks.append(
             f"ITINERARY {index}\n"
             f"price: {price} {currency}".rstrip()
             + "\n"
             + f"booking_link: {link}\n"
+            + f"outbound_date: {outbound_date.isoformat() if outbound_date else 'unspecified'}\n"
+            + f"return_date: {return_date.isoformat() if return_date else 'unspecified'}\n"
             + f"legs:\n{legs}\n"
             + "These price, legs, and booking_link values are one Kiwi result. "
             + "Do not combine them with another itinerary."
+            + (f"\nWARNING: {warning}" if warning else "")
         )
-    text = (
+    return (
         "Each block is one Kiwi itinerary. Keep its price, legs, and booking link together.\n\n"
         + "\n\n".join(blocks)
     )
-    warning = travel_eaten_warning(items, args)
-    if warning:
-        text += f"\n\nWARNING: {warning}"
-    return text
+
+
+def limit_itineraries_to_requested_dates(
+    text: str,
+    outbound: date | None,
+    returning: date | None,
+) -> str:
+    """Keep searches for the requested dates. Other searches stay, labeled as alternates."""
+    if outbound is None or "ITINERARY" not in text:
+        return text
+    blocks = re.findall(r"ITINERARY \d+\b.*?(?=\nITINERARY \d+\b|\Z)", text, re.S)
+    if not blocks:
+        return text
+    matching: list[str] = []
+    alternate: list[str] = []
+    for block in blocks:
+        out_match = re.search(r"(?m)^outbound_date:\s*(\S+)", block)
+        ret_match = re.search(r"(?m)^return_date:\s*(\S+)", block)
+        out_date = _parse_date(out_match.group(1) if out_match else "")
+        ret_date = _parse_date(ret_match.group(1) if ret_match else "")
+        same_outbound = out_date == outbound
+        same_return = returning is None or ret_date == returning
+        if same_outbound and same_return:
+            matching.append(block.strip())
+        else:
+            alternate.append(block.strip())
+    lines = [
+        f"Requested trip dates: outbound {outbound.isoformat()}"
+        + (f", return {returning.isoformat()}" if returning else "")
+        + ". Use only the itineraries in this section for the trip.",
+        "",
+    ]
+    if matching:
+        lines.append("\n\n".join(matching))
+    else:
+        lines.append("No itineraries matched the requested dates.")
+    if alternate:
+        lines.append(
+            "\nALTERNATE DATES — these searches used different dates. "
+            "Do not present them as the trip.\n"
+        )
+        lines.append("\n\n".join(alternate))
+    lines.insert(
+        0,
+        "Each block is one Kiwi itinerary. Keep its price, legs, and booking link together.",
+    )
+    return "\n".join(lines).strip() + "\n"
 
 
 def _coerce_payload(content: Any) -> Any:
@@ -1473,30 +1688,53 @@ def _coerce_payload(content: Any) -> Any:
     return content
 
 
-def _flight_call_args(messages: list[Any]) -> dict[str, Any]:
+def _flight_tool_results(messages: list[Any]) -> list[tuple[dict[str, Any], str]]:
+    calls: dict[str, dict[str, Any]] = {}
     for message in messages:
         if isinstance(message, AIMessage):
             for call in message.tool_calls or []:
-                if "flight" in str(call.get("name") or ""):
+                if call.get("id"):
                     args = call.get("args") or {}
-                    return args if isinstance(args, dict) else {}
-    return {}
+                    calls[call["id"]] = args if isinstance(args, dict) else {}
+    results: list[tuple[dict[str, Any], str]] = []
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        name = getattr(message, "name", None) or ""
+        if "flight" not in name and "ITINERARY" not in _message_text(message.content):
+            continue
+        args = calls.get(message.tool_call_id or "", {})
+        results.append((args, _message_text(message.content)))
+    return results
 
 
 def flight_specialist_text(result: dict[str, Any]) -> str | None:
-    """Return locked Kiwi blocks when the flight tools returned itineraries."""
+    """Locked Kiwi blocks. Only the requested dates are the trip; other searches are alternates."""
     messages = result.get("messages") or []
-    blobs = [
-        _message_text(message.content)
-        for message in messages
-        if isinstance(message, ToolMessage)
-    ]
-    if not blobs:
-        return None
-    rendered = render_kiwi_itineraries(_coerce_payload("\n".join(blobs)), _flight_call_args(messages))
+    pieces: list[str] = []
+    for args, content in _flight_tool_results(messages):
+        if "ITINERARY" in content and "outbound_date:" in content:
+            piece = content
+        else:
+            piece = render_kiwi_itineraries(_coerce_payload(content), args)
+        piece = re.sub(
+            r"^Each block is one Kiwi itinerary\.[^\n]*\n+",
+            "",
+            piece.strip(),
+            count=1,
+        )
+        if piece:
+            pieces.append(piece)
+    rendered = "\n\n".join(pieces)
     if "ITINERARY" not in rendered:
         return None
-    return rendered
+    human = "\n".join(
+        _message_text(message.content)
+        for message in messages
+        if getattr(message, "type", None) == "human"
+    )
+    outbound, returning = requested_trip_dates(human)
+    return limit_itineraries_to_requested_dates(rendered, outbound, returning)
 
 
 def repair_flight_pairing(answer: str, flight_text: str) -> str:
@@ -1538,12 +1776,127 @@ def _tool_blob(messages: list[Any], name: str) -> str:
     return "\n".join(parts)
 
 
+def _walk_car_offers(node: Any, found: list[tuple[str, str]]) -> None:
+    if isinstance(node, dict):
+        name = node.get("name") or node.get("vehicle")
+        price = node.get("price")
+        if isinstance(name, str) and price not in (None, "", []) and not isinstance(price, (dict, list)):
+            currency = str(node.get("currency") or "").strip()
+            found.append((name.strip(), f"{price} {currency}".strip()))
+        for value in node.values():
+            _walk_car_offers(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_car_offers(item, found)
+
+
+def extract_car_offers(text: str) -> list[tuple[str, str]]:
+    """Vehicle name and price from an OctoTrip or Upfront payload or a CARS block."""
+    found: list[tuple[str, str]] = []
+    candidates = [text]
+    if text and len(text) <= 20000:
+        candidates.extend(re.findall(r"(\{.*\}|\[.*\])", text, re.S)[:3])
+    for candidate in candidates:
+        try:
+            _walk_car_offers(json.loads(candidate), found)
+        except json.JSONDecodeError:
+            continue
+    for line in (text or "").splitlines():
+        match = re.match(r"^-\s+(.+?)\s+\|\s+(.+)$", line.strip())
+        if match:
+            found.append((match.group(1).strip(), match.group(2).strip()))
+    unique: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in found:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def render_car_block(text: str) -> str:
+    offers = extract_car_offers(text)
+    if not offers:
+        return ""
+    lines = "\n".join(f"- {name} | {price}" for name, price in offers)
+    return f"CARS:\n{lines}"
+
+
+def ensure_cars_kept(answer: str, car_text: str) -> str:
+    """Keep vehicle names and prices, and an explicit assumed age when none was stated."""
+    if not car_text.strip():
+        return answer
+    missing: list[str] = []
+    for name, price in extract_car_offers(car_text):
+        amount = price.split()[0]
+        if name.casefold() not in answer.casefold() or amount not in answer:
+            missing.append(f"- {name} | {price}")
+    extra = ""
+    if missing:
+        extra += "\n\nRental cars returned by the specialist (kept):\n" + "\n".join(missing)
+    if re.search(r"assumed age", car_text, re.I) and not re.search(r"assumed age", answer, re.I):
+        extra += (
+            "\n\nNo driver age was stated. Assumed age 30. "
+            "30 is an assumed age. Prices may change for a different age."
+        )
+    if not extra:
+        return answer
+    return answer.rstrip() + extra
+
+
+def separate_alternate_flights(answer: str, flight_text: str) -> str:
+    """Drop booking links from date searches that were not the requested trip."""
+    if "ALTERNATE DATES" not in (flight_text or ""):
+        return answer
+    primary, _, alternate = flight_text.partition("ALTERNATE DATES")
+    primary_links = set(re.findall(r"booking_link:\s*(\S+)", primary))
+    alt_links = [link for link in re.findall(r"booking_link:\s*(\S+)", alternate) if link not in primary_links]
+    if not alt_links:
+        return answer
+    kept: list[str] = []
+    removed = False
+    for line in answer.splitlines():
+        hidden = any(link in line for link in alt_links)
+        labeled = bool(re.search(r"alternate|different date", line, re.I))
+        if hidden and not labeled:
+            removed = True
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
+    if removed:
+        text += "\n\nItineraries for other dates were left out of the plan."
+    return text
+
+
+def ensure_flight_legs(answer: str, flight_text: str) -> str:
+    """Keep each matching itinerary's timed legs when the summary drops them."""
+    if "legs:" not in (flight_text or ""):
+        return answer
+    primary = flight_text.split("ALTERNATE DATES")[0]
+    times = re.findall(r"depart (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)", primary)
+    if not times or any(stamp in answer for stamp in times):
+        return answer
+    blocks = [
+        chunk.strip()
+        for chunk in re.split(r"\n(?=ITINERARY \d+)", primary)
+        if chunk.strip().startswith("ITINERARY")
+    ]
+    if not blocks:
+        return answer
+    return (
+        answer.rstrip()
+        + "\n\nFlight legs for the requested dates:\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
 def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
     """Drop ungrounded venues, unconfirmed hours, mixed flight fields, and lost hotels."""
     restaurants = _tool_blob(messages, "suggest_restaurants")
     bars = _tool_blob(messages, "suggest_bars")
     hotels = _tool_blob(messages, "search_hotels")
     flights = _tool_blob(messages, "search_flights")
+    cars = _tool_blob(messages, "suggest_rental_cars")
     allowed: set[str] = set()
     explicit_none = False
     dining_called = bool(restaurants.strip() or bars.strip())
@@ -1565,7 +1918,10 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
         if dropped and (explicit_none or not allowed) and "unavailable" not in answer.lower():
             answer = answer.rstrip() + "\n\n" + VENUE_UNAVAILABLE
     answer = ensure_hotels_kept(answer, hotel_names)
+    answer = ensure_cars_kept(answer, cars)
     answer = repair_flight_pairing(answer, flights)
+    answer = separate_alternate_flights(answer, flights)
+    answer = ensure_flight_legs(answer, flights)
     return answer
 
 
@@ -1644,6 +2000,20 @@ async def _delegate(key: str, request: str, runtime: ToolRuntime) -> str:
             locked = flight_specialist_text(result)
             if locked:
                 return locked
+        if key == "rental_car":
+            messages = result.get("messages") or []
+            evidence = "\n".join(
+                _message_text(item.content) for item in messages if isinstance(item, ToolMessage)
+            )
+            text = final_text(result)
+            block = render_car_block(evidence)
+            if block and "CARS:" not in text:
+                text = text.rstrip() + "\n\n" + block
+            age = stated_driver_age(request)
+            note = driver_age_note(age)
+            if "assumed age" in note.lower() and "assumed age" not in text.lower():
+                text = text.rstrip() + "\n" + note
+            return text
         if key in {"restaurant", "bar"}:
             messages = result.get("messages") or []
             tool_messages = [item for item in messages if isinstance(item, ToolMessage)]

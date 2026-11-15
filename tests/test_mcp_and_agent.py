@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import ToolException
 from mcp.shared.exceptions import MCPError
 
@@ -451,6 +451,56 @@ async def test_web_search_strips_dates_before_tavily(monkeypatch):
     assert seen == ["lisbon restaurants"]
 
 
+def test_grounding_lite_names_survive():
+    payload = {
+        "places": [
+            {
+                "attribution": {},
+                "googleMapsLinks": {"placeUrl": "https://maps.google.com/?cid=1"},
+                "id": "places/1",
+                "location": {"latitude": 38.71, "longitude": -9.14},
+                "place": {"attribution": {"title": "Cafe Portugal - Google Maps"}},
+            },
+            {
+                "attribution": {},
+                "googleMapsLinks": {"placeUrl": "https://maps.google.com/?cid=2"},
+                "id": "places/2",
+                "location": {"latitude": 38.71, "longitude": -9.15},
+                "place": {"attribution": {"title": "Taberna do Bairro alto - Google Maps"}},
+            },
+            {
+                "attribution": {},
+                "googleMapsLinks": {"placeUrl": "https://maps.google.com/?cid=3"},
+                "id": "places/3",
+                "location": {"latitude": 38.71, "longitude": -9.14},
+                "place": {
+                    "attribution": {
+                        "title": "Pink Bar - The smallest bar in town - Google Maps"
+                    }
+                },
+            },
+        ],
+        "summary": (
+            "Photo: Rafael Tonon\n"
+            "**Cafe Portugal**\n4.6. EUR_20\n\n"
+            "**Taberna do Bairro alto**\nHours 12:00-23:00.\n\n"
+            "**Pink Bar - The smallest bar in town**\n"
+        ),
+        "contentToken": "token",
+    }
+    names = agent.extract_grounded_venues(json.dumps(payload))
+    assert "Cafe Portugal" in names
+    assert "Taberna do Bairro alto" in names
+    assert "Pink Bar - The smallest bar in town" in names
+    assert "Rafael Tonon" not in names
+    assert all(not name.startswith("EUR") for name in names)
+    prose = "Dinner at **Cafe Portugal** and **Pink Bar - The smallest bar in town**."
+    grounded = agent.render_grounded_specialist(prose, names, json.dumps(payload), tools_called=True)
+    assert "Source unavailable" not in grounded
+    assert "Cafe Portugal" in grounded
+    assert "Pink Bar - The smallest bar in town" in grounded
+
+
 def test_credits_are_not_venues_and_headings_are():
     blob = (
         "Photo: Rafael Tonon\n"
@@ -572,6 +622,148 @@ def test_kiwi_itinerary_fields_stay_together_and_warn():
     repaired = agent.repair_flight_pairing(mixed, rendered)
     assert "intact" in repaired
     assert "https://kiwi.com/a" in repaired and "https://kiwi.com/b" in repaired
+
+
+def _kiwi_itinerary(price, link, outbound_day, return_day, arrival_day=None):
+    arrival_day = arrival_day or outbound_day
+    return {
+        "price": price,
+        "currency": "EUR",
+        "bookingUrl": link,
+        "outbound": {
+            "from": "SFO",
+            "to": "LIS",
+            "departureTime": f"{outbound_day}T08:25:00",
+            "arrivalTime": f"{arrival_day}T10:10:00",
+            "route": ["SFO", "YUL", "LIS"],
+            "segments": [
+                {
+                    "from": "SFO",
+                    "to": "YUL",
+                    "departureTime": f"{outbound_day}T08:25:00",
+                    "arrivalTime": f"{outbound_day}T16:42:00",
+                    "carrierName": "Air Canada",
+                    "flightNumber": "AC756",
+                },
+                {
+                    "from": "YUL",
+                    "to": "LIS",
+                    "departureTime": f"{outbound_day}T23:30:00",
+                    "arrivalTime": f"{arrival_day}T10:10:00",
+                    "carrierName": "Air Canada",
+                    "flightNumber": "AC812",
+                },
+            ],
+        },
+        "inbound": {
+            "from": "LIS",
+            "to": "SFO",
+            "departureTime": f"{return_day}T12:15:00",
+            "arrivalTime": f"{return_day}T22:00:00",
+            "route": ["LIS", "SFO"],
+            "segments": [
+                {
+                    "from": "LIS",
+                    "to": "SFO",
+                    "departureTime": f"{return_day}T12:15:00",
+                    "arrivalTime": f"{return_day}T22:00:00",
+                }
+            ],
+        },
+    }
+
+
+def test_kiwi_segments_keep_times_and_warn_on_late_arrival():
+    payload = {"itineraries": [_kiwi_itinerary(765, "https://kiwi.com/u/njuby4v", "2027-03-15", "2027-03-18", "2027-03-16")]}
+    rendered = agent.render_kiwi_itineraries(payload, {"departureDate": "15/03/2027", "returnDate": "18/03/2027"})
+    assert "SFO -> YUL depart 2027-03-15T08:25:00 arrive 2027-03-15T16:42:00" in rendered
+    assert "YUL -> LIS depart 2027-03-15T23:30:00 arrive 2027-03-16T10:10:00" in rendered
+    assert "depart  arrive" not in rendered
+    assert "day or more after the trip start" in rendered
+    assert "765" in rendered and "https://kiwi.com/u/njuby4v" in rendered
+
+
+def test_only_requested_flight_dates_are_the_plan():
+    match = {"itineraries": [_kiwi_itinerary(765, "https://kiwi.com/match", "2027-03-15", "2027-03-18", "2027-03-16")]}
+    early = {"itineraries": [_kiwi_itinerary(500, "https://kiwi.com/early", "2027-03-11", "2027-03-16")]}
+    later = {"itineraries": [_kiwi_itinerary(510, "https://kiwi.com/later", "2027-03-13", "2027-03-18")]}
+    result = {
+        "messages": [
+            HumanMessage(content="Book SFO to Lisbon outbound 15 March 2027 and return 18 March 2027."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search-flight",
+                        "args": {"departureDate": "15/03/2027", "returnDate": "18/03/2027"},
+                        "id": "match",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(json.dumps(match), name="search-flight", tool_call_id="match"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search-flight",
+                        "args": {"departureDate": "11/03/2027", "returnDate": "16/03/2027"},
+                        "id": "early",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(json.dumps(early), name="search-flight", tool_call_id="early"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search-flight",
+                        "args": {"departureDate": "13/03/2027", "returnDate": "18/03/2027"},
+                        "id": "later",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(json.dumps(later), name="search-flight", tool_call_id="later"),
+        ]
+    }
+    text = agent.flight_specialist_text(result)
+    assert text is not None
+    primary, alternate = text.split("ALTERNATE DATES", 1)
+    assert "https://kiwi.com/match" in primary
+    assert "https://kiwi.com/early" not in primary
+    assert "https://kiwi.com/later" not in primary
+    assert "https://kiwi.com/early" in alternate
+    assert "https://kiwi.com/later" in alternate
+    assert "SFO -> YUL depart 2027-03-15T08:25:00" in primary
+    plan = "Use https://kiwi.com/match and also https://kiwi.com/early."
+    checked = agent.apply_coordinator_checks(
+        plan, [ToolMessage(text, name="search_flights", tool_call_id="flights")]
+    )
+    assert "https://kiwi.com/early" not in checked
+    assert "https://kiwi.com/match" in checked
+    assert "2027-03-15T08:25:00" in checked
+
+
+def test_car_names_prices_and_assumed_age_stay_in_the_plan():
+    offer = {
+        "results": [
+            {
+                "name": "Peugeot 2008",
+                "vendor": "CRC Car Rental Company",
+                "price": 49.4,
+                "currency": "EUR",
+                "booking_url": "https://cars.example/peugeot",
+            }
+        ]
+    }
+    specialist = json.dumps(offer) + "\n" + agent.driver_age_note(None)
+    answer = "Reserve https://cars.example/peugeot"
+    text = agent.ensure_cars_kept(answer, specialist)
+    assert "Peugeot 2008" in text
+    assert "49.4" in text
+    assert "30 is an assumed age" in text
 
 
 def test_flight_specialist_returns_locked_blocks():
