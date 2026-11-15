@@ -1315,8 +1315,8 @@ async def test_graph_renders_cars_and_hotels_from_tool_payloads(monkeypatch):
         real_cars(result, args)
         return "OctoTrip rows were not copied onto this tool message."
 
-    def seal_hotels_without_marker(result, args=None):
-        real_hotels(result, args)
+    def seal_hotels_without_marker(result, args=None, tool_name=""):
+        real_hotels(result, args, tool_name=tool_name)
         return "Skiplagged rows were not copied onto this tool message."
 
     monkeypatch.setattr(agent, "seal_car_tool_result", seal_cars_without_marker)
@@ -2215,3 +2215,113 @@ def test_leg_key_accepts_fractional_seconds_and_zulu():
         "https://kiwi.com/zulu-cheap",
         "https://kiwi.com/zulu-later",
     ]
+
+
+@pytest.mark.asyncio
+async def test_hotel_search_then_flight_search_keeps_real_hotels():
+    agent.clear_capture()
+    hotels_md = (Path(__file__).parent / "fixtures" / "skiplagged_lisbon_hotels.md").read_text()
+    flights_md = (
+        "| Flight | Stops | Price | Notes |\n"
+        "| --- | --- | --- | --- |\n"
+        "| **$1,770** | 4 stops | $1,770 | Virtual interline |\n"
+    )
+
+    from langchain_core.tools import StructuredTool
+
+    async def sk_hotels_search(city: str, checkin: str = "", checkout: str = ""):
+        return hotels_md
+
+    async def sk_flights_search(city: str = "LIS"):
+        return flights_md
+
+    hotel_tool = agent.attach_hotel_capture(
+        StructuredTool.from_function(
+            coroutine=sk_hotels_search, name="sk_hotels_search", description="Skiplagged hotels"
+        )
+    )
+    flight_tool = agent.attach_hotel_capture(
+        StructuredTool.from_function(
+            coroutine=sk_flights_search, name="sk_flights_search", description="Skiplagged flights"
+        )
+    )
+    hotel_out = await hotel_tool.ainvoke(
+        {"city": "Lisbon", "checkin": "2027-03-15", "checkout": "2027-03-18"}
+    )
+    flight_out = await flight_tool.ainvoke({"city": "LIS"})
+    record = agent.stashed_record("hotels")
+    assert record is not None
+    rendered = agent.render_hotel_section(record)
+    assert "STRUCTURED_HOTELS" in hotel_out
+    assert "Inn Rossio Hotel" in hotel_out
+    assert "STRUCTURED_HOTELS" not in flight_out
+    assert "Inn Rossio Hotel" in rendered
+    assert "Hotels in LIS" not in rendered
+    assert "1,770" not in rendered
+    assert "Virtual interline" not in rendered
+    assert "4 stops" not in rendered
+    agent.clear_capture()
+
+
+@pytest.mark.asyncio
+async def test_hotel_specialist_tools_exclude_flight_search(monkeypatch):
+    from langchain_core.tools import StructuredTool
+
+    async def sk_hotels_search(city: str = ""):
+        return "ok"
+
+    async def sk_flights_search(origin: str = ""):
+        return "ok"
+
+    async def fake_list(name):
+        if name == "hotels":
+            return [
+                StructuredTool.from_function(
+                    coroutine=sk_hotels_search, name="sk_hotels_search", description="hotels"
+                ),
+                StructuredTool.from_function(
+                    coroutine=sk_flights_search, name="sk_flights_search", description="flights"
+                ),
+            ]
+
+        async def _run(**kwargs):
+            return "ok"
+
+        return [StructuredTool.from_function(coroutine=_run, name=f"{name}_search", description="d")]
+
+    monkeypatch.setattr(agent, "list_server_tools", fake_list)
+    agent.clear_mcp_cache()
+    specialists = await agent.build_specialists(model=agent.FakeTripModel())
+    names = set(specialists["hotel"].nodes["tools"].bound._tools_by_name)
+    assert "sk_hotels_search" in names
+    assert "web_search" in names
+    assert "sk_flights_search" not in names
+    assert not any("flight" in name.casefold() for name in names)
+    agent.clear_mcp_cache()
+
+
+def test_zero_itineraries_say_no_flights_found():
+    record = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    assert record["itineraries"] == []
+    assert agent.render_flight_section(record) == "No flights found for these dates."
+    kiwi = agent.render_kiwi_itineraries(
+        {"itineraries": [], "currency": "EUR"},
+        {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+    )
+    assert kiwi == "No flights found for these dates."
+    text = agent.apply_coordinator_checks(
+        "Flights:",
+        [ToolMessage(kiwi, name="search_flights", tool_call_id="flights")],
+    )
+    assert text.strip() == "No flights found for these dates."
+    assert "Flights:" not in text

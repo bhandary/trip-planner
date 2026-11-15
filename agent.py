@@ -1061,7 +1061,11 @@ async def build_specialists(model: BaseChatModel | None = None) -> dict[str, Any
 
     flight_tools = [attach_flight_binding(item) for item in flight_tools]
     place_tools = [attach_date_strip(item) for item in place_tools]
-    hotel_tools = [attach_hotel_capture(item) for item in hotel_tools]
+    hotel_tools = [
+        attach_hotel_capture(item)
+        for item in hotel_tools
+        if not _is_flight_tool_name(item.name)
+    ]
     if car_source == "cars":
         car_tools = [attach_call_fallback(item, "cars_alt") for item in car_tools]
     else:
@@ -1852,6 +1856,16 @@ def render_kiwi_itineraries(payload: Any, args: dict[str, Any] | None = None) ->
     args = args or {}
     items = _walk_itineraries(payload)
     if not items:
+        data = payload
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                data = None
+        if isinstance(data, dict) and any(
+            key in data and not data.get(key) for key in ("itineraries", "flights", "results")
+        ):
+            return NO_FLIGHTS_FOUND
         return payload if isinstance(payload, str) else json.dumps(payload, default=str)
     envelope_currency = str(payload.get("currency") or "") if isinstance(payload, dict) else ""
     blocks: list[str] = []
@@ -2232,15 +2246,27 @@ def stash_flight_search(search: dict[str, Any]) -> None:
     stash_record("flights", assemble_flight_record(searches, start, end))
 
 
+NO_FLIGHTS_FOUND = "No flights found for these dates."
+
+
+def _reported_no_flights(text: str) -> bool:
+    if NO_FLIGHTS_FOUND in (text or ""):
+        return True
+    return bool(re.search(r'"itineraries"\s*:\s*\[\s*\]', text or ""))
+
+
 def render_flight_section(record: dict[str, Any]) -> str:
     """Top 3 itineraries. The heading names the trip dates when they are known."""
+    itineraries = [item for item in (record.get("itineraries") or []) if isinstance(item, dict)]
+    if not itineraries:
+        return NO_FLIGHTS_FOUND
     heading = (
         "Flights"
         + _when_span(str(record.get("outbound_date") or ""), str(record.get("return_date") or ""))
         + ":"
     )
     lines = [heading]
-    for item in (record.get("itineraries") or [])[:3]:
+    for item in itineraries[:3]:
         if not isinstance(item, dict):
             continue
         currency = item.get("currency") or "EUR"
@@ -2695,10 +2721,42 @@ def seal_car_tool_result(result: Any, args: dict[str, Any] | None = None) -> str
     return format_structured("CARS", record) + "\n" + render_car_section(record)
 
 
-def seal_hotel_tool_result(result: Any, args: dict[str, Any] | None = None) -> str:
-    """Stash Skiplagged rows and lead with the record, the same way cars do."""
+def _is_flight_tool_name(name: str) -> bool:
+    folded = (name or "").casefold().replace("-", " ").replace("_", " ")
+    return "flight" in folded
+
+
+def _looks_like_flight_payload(payload: Any) -> bool:
+    """Skiplagged flight rows are not hotels, even when they arrive as a markdown table."""
+    if isinstance(payload, dict):
+        if (payload.get("itineraries") or payload.get("flights")) and not payload.get("hotels"):
+            return True
+    text = payload if isinstance(payload, str) else _payload_text(payload)
+    if re.search(r"virtual interline", text, re.I):
+        return True
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip().casefold() for cell in line.strip().strip("|").split("|")]
+        joined = " ".join(cells)
+        if "hotel" in joined or "night" in joined:
+            return False
+        if any(word in joined for word in ("flight", "stops", "stop", "airline")):
+            return True
+        return False
+    return False
+
+
+def seal_hotel_tool_result(
+    result: Any,
+    args: dict[str, Any] | None = None,
+    tool_name: str = "",
+) -> str:
+    """Stash Skiplagged hotel rows. A flight search must not become the hotel record."""
     payload = result[0] if isinstance(result, tuple) and result else result
     text = _payload_text(payload)
+    if _is_flight_tool_name(tool_name) or _looks_like_flight_payload(payload):
+        return text
     record = hotel_record_from_payload(text, args)
     if not record or not record.get("hotels"):
         return text
@@ -3378,6 +3436,12 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
     flight_record = active_flight_record(messages)
     if flight_record and flight_record.get("itineraries"):
         answer = replace_flight_section(answer, flight_record)
+    elif _reported_no_flights(flights) or (
+        flight_record is not None and not flight_record.get("itineraries") and flights.strip()
+    ):
+        answer = replace_named_section(answer, "flights", NO_FLIGHTS_FOUND)
+        if NO_FLIGHTS_FOUND not in answer:
+            answer = (answer.rstrip() + "\n\n" + NO_FLIGHTS_FOUND).strip()
     else:
         answer = repair_flight_pairing(answer, flights)
         answer = separate_alternate_flights(answer, flights)
@@ -3438,7 +3502,12 @@ def attach_hotel_capture(tool: BaseTool) -> BaseTool:
     async def wrapped(**kwargs: Any) -> Any:
         value = await original(**kwargs)
         content, artifact = value if isinstance(value, tuple) and len(value) == 2 else (value, None)
-        return _seal_tool_text(tool, content, artifact, seal_hotel_tool_result(content, kwargs))
+        return _seal_tool_text(
+            tool,
+            content,
+            artifact,
+            seal_hotel_tool_result(content, kwargs, tool_name=tool.name),
+        )
 
     tool.coroutine = wrapped
     setattr(tool, "_trip_hotel_capture", True)
