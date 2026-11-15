@@ -140,20 +140,6 @@
   }
 }
 
-.trip-banner {
-  display: block;
-  width: 100%;
-  height: clamp(72px, 14vh, 120px);
-  object-fit: cover;
-  object-position: center;
-}
-
-@media (min-width: 640px) {
-  .trip-banner {
-    height: clamp(120px, 22vh, 220px);
-  }
-}
-
 @layer utilities {
   .shadow-inner-right {
     box-shadow: inset -9px 0 6px -1px rgb(0 0 0 / 0.02);

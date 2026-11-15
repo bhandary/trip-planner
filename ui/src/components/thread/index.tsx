@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { ReactNode, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
+import Image from "next/image";
 import { cn } from "@/lib/utils";
 import { useStreamContext } from "@/providers/Stream";
 import { useState, FormEvent } from "react";
@@ -281,11 +282,6 @@ export function Thread() {
 
   return (
     <div className="flex h-dvh max-h-dvh w-full flex-col overflow-hidden">
-      <img
-        src="/banner.webp"
-        alt="Illustrated coastal scenes: a resort pool, a seaside fort, and an observation tower"
-        className="trip-banner"
-      />
       <div className="flex min-h-0 w-full flex-1 overflow-hidden">
         <div className="relative hidden lg:flex">
           <motion.div
@@ -466,12 +462,23 @@ export function Thread() {
                 footer={
                   <div className="sticky bottom-0 flex flex-col items-center gap-8 bg-white">
                     {!chatStarted && (
-                      <div className="flex items-center gap-3">
-                        <LangGraphLogoSVG className="h-8 flex-shrink-0" />
-                        <h1 className="text-2xl font-semibold tracking-tight">
-                          Agent Chat
-                        </h1>
-                      </div>
+                      <>
+                        <div className="flex items-center gap-3">
+                          <LangGraphLogoSVG className="h-8 flex-shrink-0" />
+                          <h1 className="text-2xl font-semibold tracking-tight">
+                            Agent Chat
+                          </h1>
+                        </div>
+                        <Image
+                          src="/banner.webp"
+                          alt="Illustrated coastal scenes: a resort pool, a seaside fort, and an observation tower"
+                          width={1600}
+                          height={800}
+                          sizes="(min-width: 48rem) 48rem, 100vw"
+                          priority
+                          className="mx-auto h-auto w-full max-w-3xl"
+                        />
+                      </>
                     )}
 
                     <ScrollToBottom className="animate-in fade-in-0 zoom-in-95 absolute bottom-full left-1/2 mb-4 -translate-x-1/2" />
