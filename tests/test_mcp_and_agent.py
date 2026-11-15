@@ -18,7 +18,6 @@ from agent import (
     CARS_URL,
     HOTELS_URL,
     KIWI_URL,
-    LASTMINUTE_URL,
     PLACES_URL,
     RENTAL_PROMPT,
     call_with_retry,
@@ -80,7 +79,7 @@ def test_places_omitted_without_key():
     assert targets["kiwi"] == KIWI_URL
     assert targets["hotels"] == HOTELS_URL
     assert "skiplagged.com" in HOTELS_URL
-    assert targets["lastminute"] == LASTMINUTE_URL
+    assert "lastminute" not in targets
     assert "hotels_alt" not in targets
     assert str(targets["cars"].url) == CARS_URL
     assert "trip-planner" in targets["cars"].headers["User-Agent"]
@@ -2097,3 +2096,122 @@ def test_assumed_driver_age_car_intro_is_replaced_by_the_car_block():
     assert "Rental Cars in Lisbon Airport (2027-03-15 to 2027-03-18):" in text
     assert "Peugeot 2008" in text
     assert "assumed driver age 30 — tell me yours if different" in text
+
+
+def test_headings_with_abbreviation_periods_still_replace_the_section():
+    record = {
+        "city": "Lisbon",
+        "checkin": "2027-03-15",
+        "checkout": "2027-03-18",
+        "hotels": [
+            {
+                "name": "Memmo Alfama",
+                "nightly": "€200",
+                "total": "€600",
+                "link": "https://skiplagged.com/hotel/memmo",
+            }
+        ],
+    }
+    rendered = agent.render_hotel_section(record)
+    messages = [
+        ToolMessage(
+            rendered + "\n" + agent.format_structured("HOTELS", record),
+            name="search_hotels",
+            tool_call_id="hotels",
+        )
+    ]
+    for heading in (
+        "### Hotels in Washington, D.C.",
+        "**Hotels in St. Augustine**",
+        "## Hotels (avg. 150 USD/night)",
+        "Hotels near the U.S. Capitol",
+    ):
+        answer = (
+            "- Day 1: Land, check in at Memmo Alfama, walk the hill.\n"
+            "Hotel check-in is at 3 PM.\n"
+            f"{heading}\n"
+            "- Old Capitol Hotel — €100\n"
+            "- Memmo Alfama — €200\n"
+        )
+        text = agent.apply_coordinator_checks(answer, messages)
+        assert heading not in text
+        assert "Old Capitol Hotel" not in text
+        assert text.count("Memmo Alfama") == 2
+        assert "- Day 1: Land, check in at Memmo Alfama, walk the hill." in text
+        assert "Hotel check-in is at 3 PM." in text
+        assert rendered.splitlines()[0] in text
+
+
+def test_flight_and_car_headings_with_periods_are_replaced():
+    flights = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [_tap_round_trip(320, "https://kiwi.com/default-sort")],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    rendered = agent.render_flight_section(flights)
+    flight_text = agent.apply_coordinator_checks(
+        "### Flights from Washington, D.C.\n- stale listing without a link\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("FLIGHTS", flights),
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ],
+    )
+    assert "### Flights from Washington, D.C." not in flight_text
+    assert rendered.splitlines()[0] in flight_text
+    assert "https://kiwi.com/default-sort" in flight_text
+
+    offer = {
+        "results": [
+            {
+                "name": "Peugeot 2008",
+                "vendor": "CRC Car Rental Company",
+                "price": 49.4,
+                "currency": "EUR",
+                "booking_url": "https://cars.example/peugeot",
+            }
+        ]
+    }
+    specialist = agent.seal_car_tool_result(
+        offer,
+        {
+            "location": "Lisbon Airport",
+            "pickup_date": "2027-03-15",
+            "dropoff_date": "2027-03-18",
+        },
+    )
+    car_text = agent.apply_coordinator_checks(
+        "### Rental Cars in Washington, D.C.\n- Old Fiat | 10 EUR\n",
+        [
+            HumanMessage(content="Plan Lisbon. No age was given."),
+            ToolMessage(specialist, name="suggest_rental_cars", tool_call_id="cars"),
+        ],
+    )
+    assert "### Rental Cars in Washington, D.C." not in car_text
+    assert "Old Fiat" not in car_text
+    assert "Rental Cars in Lisbon Airport (2027-03-15 to 2027-03-18):" in car_text
+    assert "Peugeot 2008" in car_text
+
+
+def test_leg_key_accepts_fractional_seconds_and_zulu():
+    morning = "LIS -> OPO depart 2026-11-21T08:30:00.000Z arrive 2026-11-21T10:00:00.000Z TAP TP238"
+    spaced = "LIS -> OPO depart 2026-11-21T08:30:00.000Z arrive 2026-11-21T10:00:00.000Z TAP TP 238"
+    evening = "LIS -> OPO depart 2026-11-21T20:30:00.000Z arrive 2026-11-21T22:00:00.000+01:00 TAP TP238"
+    cheap = {"legs": [morning], "price": "80", "booking_url": "https://kiwi.com/zulu-cheap"}
+    dear = {"legs": [spaced], "price": "140", "booking_url": "https://kiwi.com/zulu-dear"}
+    later = {"legs": [evening], "price": "90", "booking_url": "https://kiwi.com/zulu-later"}
+    assert agent.itinerary_leg_key(cheap) == agent.itinerary_leg_key(dear)
+    assert agent.itinerary_leg_key(cheap) != agent.itinerary_leg_key(later)
+    kept = agent.dedupe_itineraries_by_legs([dear, cheap, later])
+    assert [item["booking_url"] for item in kept] == [
+        "https://kiwi.com/zulu-cheap",
+        "https://kiwi.com/zulu-later",
+    ]

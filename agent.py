@@ -55,8 +55,7 @@ KIWI_URL = "https://mcp.kiwi.com"
 # Skiplagged is the hotel source. lastminute.com's streamable-HTTP endpoint
 # (https://mcp.lastminute.com/mcp) answers list_tools with HTTP 403 from a
 # Cloudflare bot challenge. The MCP client turns that non-JSON body into
-# JSON-RPC -32603, and retries only burn time.
-LASTMINUTE_URL = "https://mcp.lastminute.com/mcp"
+# JSON-RPC -32603, and retries only burn time. It is not a configured target.
 HOTELS_URL = "https://mcp.skiplagged.com/mcp"
 CARS_URL = "https://mcp.octotrip.app/rental-cars/mcp"
 CARS_ALT_URL = "https://www.upfront-rentals.com/MCP/Streamable"
@@ -113,7 +112,6 @@ def mcp_targets() -> dict[str, Any]:
     targets: dict[str, Any] = {
         "kiwi": KIWI_URL,
         "hotels": HOTELS_URL,
-        "lastminute": LASTMINUTE_URL,
         "cars": StreamableHttpTransport(
             CARS_URL,
             headers={"User-Agent": "Mozilla/5.0 (compatible; trip-planner/1.0)"},
@@ -2090,7 +2088,13 @@ def _leg_identity_from_dict(leg: dict[str, Any]) -> tuple[str, str, str] | None:
     return (number, depart, arrive)
 
 
-_LEG_WHEN = r"(?:\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?|\d{2}:\d{2}(?::\d{2})?)"
+_LEG_WHEN = (
+    r"(?:"
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+    r"|"
+    r"\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+    r")"
+)
 
 
 def _leg_identity_from_line(line: str) -> tuple[str, str, str] | None:
@@ -2859,13 +2863,32 @@ def _is_section_heading(line: str) -> bool:
     return bare.endswith(":")
 
 
+def _marked_heading(line: str) -> bool:
+    """A heading by markup: a # line, a line wrapped in ``**...**``, or one ending in ':'."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#") or stripped.endswith(":"):
+        return True
+    return bool(re.fullmatch(r"\*\*.+\*\*", stripped))
+
+
+def _is_prose_sentence(text: str) -> bool:
+    """True when punctuation ends a sentence, not an abbreviation such as D.C. or St."""
+    cleaned = re.sub(r"\b(?:St|Ft|Mt|avg)\.", "", text, flags=re.I)
+    cleaned = re.sub(r"(?<![A-Za-z])[A-Z]\.", "", cleaned)
+    if re.search(r"[!?]\s+\S", cleaned) or re.search(r"\.\s+\S", cleaned):
+        return True
+    return cleaned.rstrip().endswith((".", "!", "?"))
+
+
 def _section_kind(line: str) -> str | None:
     raw = line.strip()
     # The car intro can lead with the assumed age, so it does not start with "Rental".
     if re.search(r"assumed driver age\s*30", raw, re.I) and re.search(r"\brental cars?\b", raw, re.I):
         return "cars"
     stripped = re.sub(r"^[#>*\-\s]+", "", raw).strip()
-    if re.search(r"[.!?]", stripped) and not stripped.endswith(":"):
+    if not _marked_heading(raw) and _is_prose_sentence(stripped):
         return None
     match = re.match(
         r"(flights?|hotels?|rental cars?|car rental|restaurants?|dining|bars?)\b",
