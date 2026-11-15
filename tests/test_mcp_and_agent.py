@@ -2135,7 +2135,7 @@ def test_headings_with_abbreviation_periods_still_replace_the_section():
         )
         text = agent.apply_coordinator_checks(answer, messages)
         assert heading not in text
-        assert "Old Capitol Hotel" not in text
+        assert "Old Capitol Hotel" in text
         assert text.count("Memmo Alfama") == 2
         assert "- Day 1: Land, check in at Memmo Alfama, walk the hill." in text
         assert "Hotel check-in is at 3 PM." in text
@@ -2166,7 +2166,7 @@ def test_flight_and_car_headings_with_periods_are_replaced():
         ],
     )
     assert "### Flights from Washington, D.C." not in flight_text
-    assert "stale listing without a link" not in flight_text
+    assert "stale listing without a link" in flight_text
     assert rendered.splitlines()[0] in flight_text
     assert "https://kiwi.com/default-sort" in flight_text
 
@@ -2219,6 +2219,7 @@ def test_replaced_flight_heading_drops_generic_stale_bullets():
         "### Flights from Washington, D.C.\n"
         "- stale listing without a link\n"
         "* another stale offer\n"
+        "- TAP TP238 — 320 EUR\n"
         "- Day 1: Fly TP238 overnight.\n"
         "Meet at the airport.\n",
         [
@@ -2229,8 +2230,9 @@ def test_replaced_flight_heading_drops_generic_stale_bullets():
             )
         ],
     )
-    assert "stale listing without a link" not in text
-    assert "another stale offer" not in text
+    assert "stale listing without a link" in text
+    assert "another stale offer" in text
+    assert "TAP TP238 — 320 EUR" not in text
     assert "- Day 1: Fly TP238 overnight." in text
     assert "Meet at the airport." in text
     assert rendered.splitlines()[0] in text
@@ -2494,7 +2496,7 @@ def test_bold_checkin_sentence_is_not_a_hotel_heading():
         ],
     )
     assert "**Hotel check-in is at 3 PM.**" in text
-    assert "Old Capitol Hotel" not in text
+    assert "Old Capitol Hotel" in text
     assert "Memmo Alfama" in text
 
 
@@ -2629,7 +2631,7 @@ def test_bold_checkin_after_hotel_list_survives_the_blank_line():
             )
         ],
     )
-    assert "Old Capitol Hotel" not in text
+    assert "Old Capitol Hotel" in text
     assert "**Hotel check-in is at 3 PM.**" in text
     assert "Memmo Alfama" in text
 
@@ -2725,15 +2727,26 @@ def test_upstream_in_a_no_results_message_is_not_an_outage():
 
 
 def test_skipped_section_does_not_leave_a_double_blank():
-    text = agent.replace_named_section(
-        "Intro.\n\n\nFlights:\n- old listing\n\n\nEnjoy the city.\n",
-        "flights",
-        "Flights (2027-03-15 to 2027-03-18):\n- 320 EUR | https://kiwi.com/x",
+    record = {
+        "outbound_date": "2027-03-15",
+        "return_date": "2027-03-18",
+        "itineraries": [
+            {
+                "price": "320",
+                "currency": "EUR",
+                "booking_url": "https://kiwi.com/x",
+                "legs": ["LIS -> OPO TAP TP238"],
+            }
+        ],
+    }
+    text = agent.replace_flight_section(
+        "Intro.\n\n\nFlights:\n- TAP TP238 — 320 EUR\n\n\nEnjoy the city.\n",
+        record,
     )
     assert "\n\n\n" not in text
     assert "Enjoy the city." in text
-    assert "old listing" not in text
-    assert "Flights (2027-03-15 to 2027-03-18):" in text
+    assert "TAP TP238 — 320 EUR" not in text
+    assert "https://kiwi.com/x" in text
 
 
 def test_blank_fare_renders_price_unavailable():
@@ -2754,3 +2767,90 @@ def test_blank_fare_renders_price_unavailable():
     assert "price unavailable" in text
     assert "- EUR" not in text
     assert "https://kiwi.com/blank" in text
+
+
+def test_day_plan_after_the_hotel_list_is_kept():
+    record = {
+        "city": "Lisbon",
+        "checkin": "2027-03-15",
+        "checkout": "2027-03-18",
+        "hotels": [
+            {
+                "name": "Memmo Alfama",
+                "nightly": "€150",
+                "total": "€450",
+                "link": "https://skiplagged.com/hotel/memmo",
+            }
+        ],
+    }
+    rendered = agent.render_hotel_section(record)
+    text = agent.apply_coordinator_checks(
+        "Hotels in Lisbon:\n"
+        "- Memmo Alfama 150 EUR\n"
+        "\n"
+        "**Day 1 - Arrival**\n"
+        "- Morning: check in\n"
+        "- Evening: Fado, 35 EUR\n"
+        "\n"
+        "- Bring a plug adapter\n"
+        "- City tax is 4 EUR per night\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("HOTELS", record),
+                name="search_hotels",
+                tool_call_id="hotels",
+            )
+        ],
+    )
+    assert text.count("Memmo Alfama") == 1
+    assert "**Day 1 - Arrival**" in text
+    assert "- Morning: check in" in text
+    assert "- Evening: Fado, 35 EUR" in text
+    assert "- Bring a plug adapter" in text
+    assert "- City tax is 4 EUR per night" in text
+
+
+def test_day_plan_and_ground_transport_after_flights_are_kept():
+    flights = agent.assemble_flight_record(
+        [
+            {
+                "args": {"departureDate": "2027-03-15", "returnDate": "2027-03-18"},
+                "itineraries": [_tap_round_trip(320, "https://kiwi.com/default-sort")],
+                "currency": "EUR",
+            }
+        ],
+        date(2027, 3, 15),
+        date(2027, 3, 18),
+    )
+    rendered = agent.render_flight_section(flights)
+    text = agent.apply_coordinator_checks(
+        "Flights:\n"
+        "- TAP TP238 300 EUR\n"
+        "\n"
+        "**Day 1 - Arrival**\n"
+        "- Morning: check in\n"
+        "\n"
+        "**Getting around**\n"
+        "- Train IC520 to Porto, 25 EUR\n"
+        "- Metro from the airport\n"
+        "\n"
+        "**Option 2: Delta DL100**\n"
+        "- Fare: 380 EUR\n"
+        "2. Delta DL100 — 380 EUR\n",
+        [
+            ToolMessage(
+                rendered + "\n" + agent.format_structured("FLIGHTS", flights),
+                name="search_flights",
+                tool_call_id="flights",
+            )
+        ],
+    )
+    assert "TAP TP238 300 EUR" not in text
+    assert "**Day 1 - Arrival**" in text
+    assert "- Morning: check in" in text
+    assert "**Getting around**" in text
+    assert "- Train IC520 to Porto, 25 EUR" in text
+    assert "- Metro from the airport" in text
+    assert "Option 2: Delta DL100" not in text
+    assert "Fare: 380 EUR" not in text
+    assert "2. Delta DL100 — 380 EUR" not in text
