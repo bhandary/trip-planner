@@ -12,7 +12,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start -H 0.0.0.0",
+    "start": "next start -H 0.0.0.0 -p ${PORT:-3000}",
     "lint": "NODE_OPTIONS='--require ./scripts/use-typescript6.cjs' eslint .",
     "lint:fix": "NODE_OPTIONS='--require ./scripts/use-typescript6.cjs' eslint . --fix",
     "format": "prettier --write .",

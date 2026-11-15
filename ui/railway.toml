@@ -1,10 +1,13 @@
+# Frontend service. Set this service's root directory to `ui`.
+# Paths below are relative to that root.
+# Start command is the Dockerfile CMD: node server.js on 0.0.0.0:$PORT.
+
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "pnpm start"
 healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
+restartPolicyMaxRetries = 3

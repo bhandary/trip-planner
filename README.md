@@ -79,39 +79,46 @@ If the car server errors or times out, the car agent uses Upfront Rentals. If a 
 
 ## Deploy to Railway
 
-Do this as two services from this repo. No LangSmith license is required.
-
-The backend is `langgraph dev` (`langgraph-cli[inmem]`). It speaks the Agent Server protocol the chat UI uses (threads, runs, streaming) and does not need `LANGGRAPH_CLOUD_LICENSE_KEY`. `langgraph up` is the licensed deployment path, so it is not used here. The tradeoff is that threads stay on the instance disk and disappear when the container is replaced.
+Two services from this repo. Do not deploy `langgraph up` for this first cut. That command builds the licensed Agent Server.
 
 ### Backend service
 
 - Root directory: repository root
-- Config: `Dockerfile` and `railway.toml`
-- Listens on `0.0.0.0:$PORT`
+- Config: `Dockerfile`, `railway.toml`, and `Procfile`
+- Build: the Dockerfile installs the package and runs `scripts/start-backend.sh`
+- Start command: `sh scripts/start-backend.sh`
+- Bind: `langgraph dev --host 0.0.0.0 --port $PORT` (`PORT` defaults to 2024)
 - Health check: `GET /health`
-- Start command: `sh scripts/start-backend.sh` (`Procfile` and `railway.toml`). It runs `langgraph dev --host 0.0.0.0 --port $PORT`.
-- Variables: `OPENAI_API_KEY`, `TAVILY_API_KEY`, and `GOOGLE_MAPS_API_KEY` (see above). Optional: `OPENAI_MODEL`, `TRIP_PLANNER_MODEL`, `GOOGLE_MAPS_KEY`, `MCP_TIMEOUT_SECONDS`. Leave `TRIP_PLANNER_FAKE_LLM` unset.
+- Variables: `OPENAI_API_KEY`, `TAVILY_API_KEY`, `GOOGLE_MAPS_API_KEY`, and `PORT` (Railway sets `PORT`). Also set `CORS_ALLOW_ORIGINS` to the UI origin (below). Optional: `OPENAI_MODEL`, `TRIP_PLANNER_MODEL`, `GOOGLE_MAPS_KEY`, `MCP_TIMEOUT_SECONDS`. Leave `TRIP_PLANNER_FAKE_LLM` unset.
 
-Generate a public domain. The examples below assume the service is named `trip-planner`.
+Generate a public domain. The frontend example assumes this service is named `trip-planner`.
+
+The browser calls this API from the UI's origin. LangGraph reads `CORS_ALLOW_ORIGINS` (comma-separated). Its own default is `*`. The start script does not use that: when the variable is unset it allows `http://localhost:3000` and `http://127.0.0.1:3000` only. On Railway set the UI's public origin, for example `https://trip-planner-ui.up.railway.app`.
 
 Every MCP server in this project is remote streamable HTTP. The backend image does not install Node, and it does not spawn `npx` or stdio MCP processes. A server that is down is reported as unavailable.
 
-### Frontend service
+### UI service
 
 - Root directory: `ui`
-- Config: `ui/Dockerfile` and `ui/railway.toml`
-- Listens on `0.0.0.0:$PORT`
+- Config: `ui/Dockerfile` and `ui/railway.toml` (same shape as the hike-ui service: Dockerfile builder, health check `/health`, no start-command override)
+- Build command: `pnpm build` inside the image. `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_ASSISTANT_ID` are build args.
+- Start command: `node server.js` (the image CMD). Locally, after `pnpm build`, `pnpm start` is `next start -H 0.0.0.0 -p $PORT`.
+- Bind: `0.0.0.0` and `$PORT` (`PORT` defaults to 3000)
 - Health check: `GET /health`
-- Build-time variables (Next.js inlines `NEXT_PUBLIC_*` during `pnpm build`):
+- Backend URL: `NEXT_PUBLIC_API_URL`. The UI reads that name (see `ui/next.config.mjs` and `ui/src/providers/Stream.tsx`). If it is unset at build time, the default is `http://localhost:2024`.
+
+`NEXT_PUBLIC_*` is inlined by `next build`. Set it on the UI service before the Docker build, then redeploy when it changes. A new value in the running container does nothing until the next build.
 
 ```
 NEXT_PUBLIC_API_URL=https://${{trip-planner.RAILWAY_PUBLIC_DOMAIN}}
 NEXT_PUBLIC_ASSISTANT_ID=trip_planner
 ```
 
-`NEXT_PUBLIC_API_URL` is a Railway reference variable. It must be set on the frontend service before the Docker build, because the Dockerfile declares matching `ARG`s and the browser bundle bakes in the value. Redeploy the frontend after the backend domain exists.
+Copy `ui/.env.example` to `ui/.env` for local `pnpm dev`. Do not put API keys in it.
 
-The browser calls the backend directly, so the backend URL has to be reachable from the user's browser.
+### Production upgrade
+
+This first deploy uses `langgraph dev` (in-memory, dev server). For production move to `langgraph build` / `langgraph up` or the LangGraph platform image with Postgres and Redis. `langgraph up` needs `LANGGRAPH_CLOUD_LICENSE_KEY`. Threads from `langgraph dev` disappear when the container is replaced.
 
 ## Layout
 

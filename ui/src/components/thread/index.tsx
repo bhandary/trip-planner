@@ -283,7 +283,7 @@ export function Thread() {
     <div className="flex h-dvh max-h-dvh w-full flex-col overflow-hidden">
       <img
         src="/banner.webp"
-        alt="Illustrated coastal scenes: a resort pool, a seaside fort, and a lighthouse"
+        alt="Illustrated coastal scenes: a resort pool, a seaside fort, and an observation tower"
         className="trip-banner"
       />
       <div className="flex min-h-0 w-full flex-1 overflow-hidden">

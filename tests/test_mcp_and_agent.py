@@ -1855,12 +1855,36 @@ def test_start_config_binds_port_and_documents_env():
     assert "--host 0.0.0.0" in script
     assert 'PORT="${PORT:-2024}"' in script
     assert '--port "$PORT"' in script
+    assert "CORS_ALLOW_ORIGINS" in script
+    assert 'CORS_ALLOW_ORIGINS="*"' not in script
+    assert "http://localhost:3000" in script
     assert "start-backend.sh" in Path("Procfile").read_text()
     railway = Path("railway.toml").read_text()
     assert "start-backend.sh" in railway
     assert "/health" in railway
+    ui_railway = Path("ui/railway.toml").read_text()
+    ui_docker = Path("ui/Dockerfile").read_text()
+    ui_package = Path("ui/package.json").read_text()
+    assert "DOCKERFILE" in ui_railway
+    assert "/health" in ui_railway
+    assert "node server.js" in ui_docker or 'CMD ["node", "server.js"]' in ui_docker
+    assert "HOSTNAME=0.0.0.0" in ui_docker
+    assert "PORT=3000" in ui_docker
+    assert "NEXT_PUBLIC_API_URL" in ui_docker
+    assert "next start -H 0.0.0.0" in ui_package
+    assert "${PORT:-3000}" in ui_package
+    banner = Path("ui/src/components/thread/index.tsx").read_text()
+    assert (
+        "Illustrated coastal scenes: a resort pool, a seaside fort, and an observation tower"
+        in banner
+    )
     readme = Path("README.md").read_text()
     example = Path(".env.example").read_text()
-    for key in ("OPENAI_API_KEY", "TAVILY_API_KEY", "GOOGLE_MAPS_API_KEY"):
+    ui_example = Path("ui/.env.example").read_text()
+    for key in ("OPENAI_API_KEY", "TAVILY_API_KEY", "GOOGLE_MAPS_API_KEY", "PORT", "CORS_ALLOW_ORIGINS"):
         assert key in readme
         assert key in example
+    assert "NEXT_PUBLIC_API_URL" in readme
+    assert "NEXT_PUBLIC_API_URL" in ui_example
+    assert "langgraph dev" in readme
+    assert "langgraph up" in readme
