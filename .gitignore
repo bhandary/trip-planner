@@ -1,0 +1,13 @@
+.env
+.venv
+.venv/
+ui/AGENTS.md
+__pycache__/
+.pytest_cache/
+.langgraph_api/
+*.pyc
+.mypy_cache/
+ui/node_modules/
+ui/.next/
+ui/.env
+ui/.env.local
