@@ -55,10 +55,8 @@ KIWI_URL = "https://mcp.kiwi.com"
 # Skiplagged is the hotel source. lastminute.com's streamable-HTTP endpoint
 # (https://mcp.lastminute.com/mcp) answers list_tools with HTTP 403 from a
 # Cloudflare bot challenge. The MCP client turns that non-JSON body into
-# JSON-RPC -32603, and retries only burn time.
-LASTMINUTE_URL = "https://mcp.lastminute.com/mcp"
+# JSON-RPC -32603, and retries only burn time. It is not a configured target.
 HOTELS_URL = "https://mcp.skiplagged.com/mcp"
-HOTELS_ALT_URL = LASTMINUTE_URL
 CARS_URL = "https://mcp.octotrip.app/rental-cars/mcp"
 CARS_ALT_URL = "https://www.upfront-rentals.com/MCP/Streamable"
 PLACES_URL = "https://mapstools.googleapis.com/mcp"
@@ -114,7 +112,6 @@ def mcp_targets() -> dict[str, Any]:
     targets: dict[str, Any] = {
         "kiwi": KIWI_URL,
         "hotels": HOTELS_URL,
-        "lastminute": LASTMINUTE_URL,
         "cars": StreamableHttpTransport(
             CARS_URL,
             headers={"User-Agent": "Mozilla/5.0 (compatible; trip-planner/1.0)"},
@@ -1046,11 +1043,10 @@ async def build_specialists(model: BaseChatModel | None = None) -> dict[str, Any
 
     Mirrors the requested wiring: one catalog, per-server tool lists, then
     ``create_agent(model, tools=server_tools + [web_search], system_prompt=...)``.
-    Skiplagged is the hotel source. lastminute.com is skipped. Upfront is the
+    Skiplagged is the hotel source. lastminute.com is not called. Upfront is the
     car fallback. Google Maps is registered only when ``GOOGLE_MAPS_KEY`` or
     ``GOOGLE_MAPS_API_KEY`` is set.
     """
-    warn_lastminute_once()
     flight_tools, flight_source, flight_errors = await load_with_fallback("kiwi")
     hotel_tools, hotel_source, hotel_errors = await load_with_fallback("hotels")
     car_tools, car_source, car_errors = await load_with_fallback("cars", "cars_alt")
@@ -1065,7 +1061,11 @@ async def build_specialists(model: BaseChatModel | None = None) -> dict[str, Any
 
     flight_tools = [attach_flight_binding(item) for item in flight_tools]
     place_tools = [attach_date_strip(item) for item in place_tools]
-    hotel_tools = [attach_hotel_capture(item) for item in hotel_tools]
+    hotel_tools = [
+        attach_hotel_capture(item)
+        for item in hotel_tools
+        if not _is_flight_tool_name(item.name)
+    ]
     if car_source == "cars":
         car_tools = [attach_call_fallback(item, "cars_alt") for item in car_tools]
     else:
@@ -1856,6 +1856,17 @@ def render_kiwi_itineraries(payload: Any, args: dict[str, Any] | None = None) ->
     args = args or {}
     items = _walk_itineraries(payload)
     if not items:
+        data = payload
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                data = None
+        if isinstance(data, dict):
+            if _flight_payload_is_outage(data):
+                return FLIGHT_SOURCE_UNAVAILABLE
+            if any(key in data and not data.get(key) for key in ("itineraries", "flights", "results")):
+                return NO_FLIGHTS_FOUND
         return payload if isinstance(payload, str) else json.dumps(payload, default=str)
     envelope_currency = str(payload.get("currency") or "") if isinstance(payload, dict) else ""
     blocks: list[str] = []
@@ -2016,10 +2027,13 @@ def _return_departure(item: dict[str, Any]) -> date | None:
 
 
 def _fare_amount(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return float("inf")
     try:
-        return float(str(value or "").split()[0])
-    except ValueError:
-        return 1e18
+        return float(text.split()[0].replace(",", ""))
+    except (ValueError, IndexError):
+        return float("inf")
 
 
 def _normalize_itinerary(
@@ -2044,8 +2058,42 @@ def _normalize_itinerary(
     }
 
 
+def _flight_code(carrier: str, number: str) -> str:
+    """Carrier plus flight number, with spaces removed. ``TP 238`` and ``U2 8123`` collapse."""
+    number_compact = re.sub(r"[^A-Za-z0-9]", "", number or "").upper()
+    carrier_compact = re.sub(r"[^A-Za-z0-9]", "", carrier or "").upper()
+    if not number_compact:
+        return ""
+    if re.fullmatch(r"\d{2,4}", number_compact) and re.fullmatch(r"[A-Z0-9]{2}", carrier_compact):
+        return carrier_compact + number_compact
+    if re.search(r"\d", number_compact):
+        return number_compact
+    return ""
+
+
+def _flight_code_from_tail(tail: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9]+", tail or "")
+    if not tokens:
+        return ""
+    if (
+        len(tokens) >= 2
+        and re.fullmatch(r"\d{2,4}", tokens[-1])
+        and re.fullmatch(r"[A-Za-z0-9]{2}", tokens[-2])
+    ):
+        return _flight_code(tokens[-2], tokens[-1])
+    return _flight_code("", tokens[-1])
+
+
+def _leg_carrier_code(leg: dict[str, Any]) -> str:
+    for key in ("carrierCode", "airlineCode", "carrier"):
+        raw = str(leg.get(key) or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9]{2}", raw):
+            return raw
+    return ""
+
+
 def _leg_identity_from_dict(leg: dict[str, Any]) -> tuple[str, str, str] | None:
-    number = re.sub(r"\s+", "", str(leg.get("flightNumber") or "")).upper()
+    number = _flight_code(_leg_carrier_code(leg), str(leg.get("flightNumber") or ""))
     depart = str(
         leg.get("departureTime") or leg.get("local_departure") or leg.get("departure") or ""
     ).strip()
@@ -2055,13 +2103,27 @@ def _leg_identity_from_dict(leg: dict[str, Any]) -> tuple[str, str, str] | None:
     return (number, depart, arrive)
 
 
+_LEG_WHEN = (
+    r"(?:"
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+    r"|"
+    r"\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+    r")"
+)
+
+
 def _leg_identity_from_line(line: str) -> tuple[str, str, str] | None:
-    depart = re.search(r"depart\s+(\S+)", line)
-    arrive = re.search(r"arrive\s+(\S+)", line)
-    numbers = re.findall(r"\b([A-Z]{1,3}\d{2,4})\b", line)
-    if not numbers or not depart or not arrive:
+    match = re.search(
+        rf"depart\s+({_LEG_WHEN})\s+arrive\s+({_LEG_WHEN})(?:\s+(.*?))?\s*$",
+        line.strip(),
+        re.I,
+    )
+    if not match:
         return None
-    return (numbers[-1], depart.group(1), arrive.group(1))
+    number = _flight_code_from_tail(match.group(3) or "")
+    if not number:
+        return None
+    return (number, match.group(1), match.group(2))
 
 
 def itinerary_leg_key(item: dict[str, Any]) -> tuple[tuple[str, str, str], ...] | None:
@@ -2185,22 +2247,91 @@ def stash_flight_search(search: dict[str, Any]) -> None:
     stash_record("flights", assemble_flight_record(searches, start, end))
 
 
+NO_FLIGHTS_FOUND = "No flights found for these dates."
+FLIGHT_SOURCE_UNAVAILABLE = "The flight source is unavailable."
+_FLIGHT_OUTAGE = re.compile(r"unavailable|time-?d?\s*out|rate[\s-]*limit", re.I)
+
+
+def _flight_payload_is_outage(data: dict[str, Any]) -> bool:
+    """An ``error`` key, or a message that the source failed. ``No results`` is an empty search."""
+    if data.get("error"):
+        return True
+    message = data.get("message")
+    return isinstance(message, str) and bool(_FLIGHT_OUTAGE.search(message))
+
+
+def _flight_result_texts(messages: list[Any]) -> list[str]:
+    return [
+        _message_text(message.content)
+        for message in messages or []
+        if isinstance(message, ToolMessage) and getattr(message, "name", None) == "search_flights"
+    ]
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    stripped = (text or "").strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _result_found_flights(text: str) -> bool:
+    """A search that names a fare, even when it is not a structured itinerary block."""
+    if "ITINERARY" in (text or "") and re.search(r"(?m)^(?:price|booking_link):", text):
+        return True
+    saved = read_structured(text or "", "FLIGHTS")
+    if saved and saved.get("itineraries"):
+        return True
+    if re.search(r"kiwi\.com", text or "", re.I):
+        return True
+    return bool(_FLIGHT_PRICE.search(text or "") and re.search(r"\b[A-Z]{1,3}\d{2,4}\b", text or ""))
+
+
+def _result_reports_no_flights(text: str) -> bool:
+    if _result_found_flights(text):
+        return False
+    data = _json_object(text)
+    if data is not None:
+        if _flight_payload_is_outage(data):
+            return False
+        return any(key in data and not data.get(key) for key in ("itineraries", "flights", "results"))
+    return NO_FLIGHTS_FOUND in (text or "")
+
+
+def _searches_found_no_flights(messages: list[Any]) -> bool:
+    """True only when no search returned a flight and the latest one came back empty."""
+    results = _flight_result_texts(messages)
+    if not results or any(_result_found_flights(item) for item in results):
+        return False
+    return _result_reports_no_flights(results[-1])
+
+
 def render_flight_section(record: dict[str, Any]) -> str:
     """Top 3 itineraries. The heading names the trip dates when they are known."""
+    itineraries = [item for item in (record.get("itineraries") or []) if isinstance(item, dict)]
+    if not itineraries:
+        return NO_FLIGHTS_FOUND
     heading = (
         "Flights"
         + _when_span(str(record.get("outbound_date") or ""), str(record.get("return_date") or ""))
         + ":"
     )
     lines = [heading]
-    for item in (record.get("itineraries") or [])[:3]:
+    for item in itineraries[:3]:
         if not isinstance(item, dict):
             continue
         currency = item.get("currency") or "EUR"
-        if item.get("return_price"):
-            fare = f"{item.get('price') or ''} {currency} + {item.get('return_price')} {currency}".strip()
+        raw_price = item.get("price")
+        if raw_price is None or str(raw_price).strip() == "":
+            fare = "price unavailable"
+        elif item.get("return_price"):
+            fare = f"{raw_price} {currency} + {item.get('return_price')} {currency}".strip()
         else:
-            fare = f"{item.get('price') or ''} {currency}".strip()
+            fare = f"{raw_price} {currency}".strip()
         links = [str(item.get("booking_url") or ""), str(item.get("return_url") or "")]
         lines.append("- " + " | ".join([fare, *[link for link in links if link]]))
         for leg in item.get("legs") or []:
@@ -2215,6 +2346,12 @@ def flight_record_from_messages(messages: list[Any]) -> dict[str, Any] | None:
     text = "\n".join(_message_payload_text(item) for item in messages or [] if _toolish(item))
     saved = read_structured(text, "FLIGHTS")
     if saved and saved.get("itineraries"):
+        items = dedupe_itineraries_by_legs(
+            [item for item in saved["itineraries"] if isinstance(item, dict)]
+        )
+        items.sort(key=_itinerary_total)
+        saved = dict(saved)
+        saved["itineraries"] = items[:3]
         return saved
     primary = text.split("ALTERNATE DATES")[0]
     itineraries: list[dict[str, Any]] = []
@@ -2251,7 +2388,7 @@ def flight_record_from_messages(messages: list[Any]) -> dict[str, Any] | None:
     if not itineraries:
         return None
     itineraries = dedupe_itineraries_by_legs(itineraries)
-    itineraries.sort(key=lambda item: _fare_amount(item.get("price")))
+    itineraries.sort(key=_itinerary_total)
     return {
         "outbound_date": outbound,
         "return_date": returning,
@@ -2289,13 +2426,50 @@ def _record_flight_numbers(record: dict[str, Any]) -> set[str]:
     return numbers
 
 
+_FLIGHT_PRICE = re.compile(
+    r"(?:[$€£]\s*\d|\b\d+(?:[.,]\d+)?\s*(?:EUR|USD|GBP)\b|\b(?:EUR|USD|GBP)\s*\d)",
+    re.I,
+)
+
+
+_FLIGHT_FIELD = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:\*\*)?(price|outbound|return)(?:\*\*)?\s*:\s*\S",
+    re.I,
+)
+
+
+def _line_restates_flight_fields(line: str, record: dict[str, Any]) -> bool:
+    """A short Price / Outbound / Return line that repeats the first rendered itinerary."""
+    if not _FLIGHT_FIELD.match(line) or len(line.strip()) > 160:
+        return False
+    itineraries = [item for item in record.get("itineraries") or [] if isinstance(item, dict)]
+    if not itineraries:
+        return False
+    first = itineraries[0]
+    parts = str(first.get("price") or "").split()
+    price = parts[0] if parts else ""
+    if price and re.search(rf"\b{re.escape(price)}\b", line):
+        return True
+    numbers = _record_flight_numbers({"itineraries": [first]})
+    return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
+
+
+def _line_mentions_flight_number(line: str, numbers: set[str]) -> bool:
+    return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
+
+
 def _line_restates_itinerary(line: str, urls: set[str], numbers: set[str]) -> bool:
-    """A list line that repeats a rendered booking link or its flight numbers."""
+    """A restatement pairs a rendered flight number with a price or booking link.
+
+    A day-plan bullet that names the flight is the itinerary, not a second copy.
+    """
+    if _DAY_LINE.search(line):
+        return False
     if any(url and url in line for url in urls):
         return True
-    if not numbers or not re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+    if not _line_mentions_flight_number(line, numbers):
         return False
-    return any(re.search(rf"\b{re.escape(number)}\b", line) for number in numbers)
+    return bool(_FLIGHT_PRICE.search(line) or re.search(r"https?://", line))
 
 
 def _split_around(text: str, section: str) -> tuple[list[str], list[str]] | None:
@@ -2324,18 +2498,29 @@ def replace_flight_section(answer: str, record: dict[str, Any]) -> str:
             return False
         if _line_restates_itinerary(line, kept, numbers):
             return False
+        if _line_restates_flight_fields(line, record):
+            return False
         return True
+
+    def outside(chunk: list[str]) -> list[str]:
+        return [line for line in _under_named_heading(chunk, "flights") if keep(line)]
 
     parts = _split_around(text, section)
     if parts is None:
         section_lines = set(section.splitlines())
-        lines = [line for line in text.splitlines() if line in section_lines or keep(line)]
+        body = [line for line in text.splitlines() if line not in section_lines]
+        lines = [*outside(body), *section.splitlines()]
         return scrub_false_no_return("\n".join(lines).strip(), record)
     before, after = parts
-    lines = [line for line in before if keep(line)]
+    fares = _record_fare_tokens(record)
+    after = _drop_structured_repeats(
+        after,
+        lambda line: _line_matches_structured_flight(line, numbers, fares),
+    )
+    lines = outside(before)
     lines.extend(section.splitlines())
-    lines.extend(line for line in after if keep(line))
-    return scrub_false_no_return("\n".join(lines).strip(), record)
+    lines.extend(outside(after))
+    return _collapse_blank_lines(scrub_false_no_return("\n".join(lines), record))
 
 
 def _coerce_payload(content: Any) -> Any:
@@ -2624,10 +2809,42 @@ def seal_car_tool_result(result: Any, args: dict[str, Any] | None = None) -> str
     return format_structured("CARS", record) + "\n" + render_car_section(record)
 
 
-def seal_hotel_tool_result(result: Any, args: dict[str, Any] | None = None) -> str:
-    """Stash Skiplagged rows and lead with the record, the same way cars do."""
+def _is_flight_tool_name(name: str) -> bool:
+    folded = (name or "").casefold().replace("-", " ").replace("_", " ")
+    return "flight" in folded
+
+
+def _looks_like_flight_payload(payload: Any) -> bool:
+    """Skiplagged flight rows are not hotels, even when they arrive as a markdown table."""
+    if isinstance(payload, dict):
+        if (payload.get("itineraries") or payload.get("flights")) and not payload.get("hotels"):
+            return True
+    text = payload if isinstance(payload, str) else _payload_text(payload)
+    if re.search(r"virtual interline", text, re.I):
+        return True
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip().casefold() for cell in line.strip().strip("|").split("|")]
+        joined = " ".join(cells)
+        if "hotel" in joined or "night" in joined:
+            return False
+        if re.search(r"\b(?:flight|stops?|airline)\b", joined):
+            return True
+        return False
+    return False
+
+
+def seal_hotel_tool_result(
+    result: Any,
+    args: dict[str, Any] | None = None,
+    tool_name: str = "",
+) -> str:
+    """Stash Skiplagged hotel rows. A flight search must not become the hotel record."""
     payload = result[0] if isinstance(result, tuple) and result else result
     text = _payload_text(payload)
+    if _is_flight_tool_name(tool_name) or _looks_like_flight_payload(payload):
+        return text
     record = hotel_record_from_payload(text, args)
     if not record or not record.get("hotels"):
         return text
@@ -2780,18 +2997,42 @@ def render_hotel_section(record: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _section_kind(line: str) -> str | None:
-    stripped = re.sub(r"^[#>*\-\s]+", "", line).strip()
-    match = re.match(
-        r"(flights?|hotels?|rental cars?|car rental|restaurants?|dining|bars?)\b",
-        stripped,
-        re.I,
-    )
-    if not match:
-        return None
-    if len(stripped) > 90 and not stripped.endswith(":"):
-        return None
-    word = match.group(1).lower()
+def _is_section_heading(line: str) -> bool:
+    """A heading ends with ':' or starts with '#'. A sentence is not a heading."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return True
+    bare = re.sub(r"^[#>*\-\s]+", "", stripped)
+    bare = re.sub(r"[*_`]", "", bare).strip()
+    return bare.endswith(":")
+
+
+def _marked_heading(line: str) -> bool:
+    """A heading by markup: a # line, a line wrapped in ``**...**``, or one ending in ':'."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#") or stripped.endswith(":"):
+        return True
+    wrapped = re.fullmatch(r"\*\*(.+)\*\*", stripped)
+    if not wrapped:
+        return False
+    return not _is_prose_sentence(wrapped.group(1).strip())
+
+
+def _is_prose_sentence(text: str) -> bool:
+    """True when punctuation ends a sentence, not an abbreviation such as D.C. or St."""
+    cleaned = re.sub(r"\b(?:St|Ft|Mt|avg)\.", "", text, flags=re.I)
+    cleaned = re.sub(r"(?<![A-Za-z])[A-Z]\.", "", cleaned)
+    if re.search(r"[!?]\s+\S", cleaned) or re.search(r"\.\s+\S", cleaned):
+        return True
+    return cleaned.rstrip().endswith((".", "!", "?"))
+
+
+def _kind_from_section_word(word: str) -> str | None:
+    word = word.lower()
     if word.startswith("flight"):
         return "flights"
     if word.startswith("hotel"):
@@ -2805,17 +3046,72 @@ def _section_kind(line: str) -> str | None:
     return None
 
 
+def _section_kind(line: str) -> str | None:
+    raw = line.strip()
+    # The car intro can lead with the assumed age, so it does not start with "Rental".
+    if re.search(r"assumed driver age\s*30", raw, re.I) and re.search(r"\brental cars?\b", raw, re.I):
+        return "cars"
+    # A bullet is an offer or a tip, not a section heading. ``- Hotel Avenida Palace``
+    # used to match ``hotels?`` after the marker was stripped.
+    if _list_item_body(raw) is not None and not raw.lstrip().startswith("#"):
+        return None
+    # A bold line is a section heading only when its whole text is the section
+    # title (``**Hotels**``, ``**Hotels in St. Augustine**``). ``**Hotel Two**`` is a name.
+    wrapped = re.fullmatch(r"\*\*(.+)\*\*", raw)
+    if wrapped:
+        inner = wrapped.group(1).strip()
+        if _is_prose_sentence(inner):
+            return None
+        title = inner.rstrip(":").strip()
+        match = re.match(
+            r"(flights|hotels|rental cars?|car rental|restaurants?|dining|bars?)\b",
+            title,
+            re.I,
+        )
+        if not match or len(title) > 90:
+            return None
+        return _kind_from_section_word(match.group(1))
+    stripped = re.sub(r"^[#>*\-\s]+", "", raw).strip()
+    bare = re.sub(r"[*_`]", "", stripped).strip()
+    if not _marked_heading(raw) and _is_prose_sentence(bare):
+        return None
+    match = re.match(
+        r"(flights?|hotels?|rental cars?|car rental|restaurants?|dining|bars?)\b",
+        stripped,
+        re.I,
+    )
+    if not match:
+        return None
+    if len(stripped) > 90 and not stripped.endswith(":"):
+        return None
+    return _kind_from_section_word(match.group(1))
+
+
 def _label_only_line(line: str) -> bool:
     cleaned = re.sub(r"[*_`#]", "", line)
     cleaned = re.sub(r"^[\-\d.)\s]+", "", cleaned).strip().strip(":").casefold()
     return bool(cleaned) and cleaned in HOTEL_FIELD_LABELS
 
 
+def _old_list_line(line: str) -> bool:
+    """A bullet or bold line in the old list, other than a day plan or a labelled alternate."""
+    stripped = line.strip()
+    if not stripped or _DAY_LINE.search(stripped) or _labelled_alternate_flight(line):
+        return False
+    if _list_item_body(line) is not None:
+        return True
+    return re.fullmatch(r"\*\*.+\*\*", stripped) is not None
+
+
 def _skippable_section_line(kind: str, line: str) -> bool:
-    """Lines that belong to the coordinator's old cars or hotels block."""
+    """Lines that belong to the coordinator's old cars block.
+
+    Hotels and flights are not guessed from markup. Those repeats are removed
+    only when the line names a structured result.
+    """
     stripped = line.strip()
     if not stripped:
-        return True
+        return kind not in {"hotels", "flights"}
     if _section_kind(line):
         return False
     if _label_only_line(line):
@@ -2826,9 +3122,12 @@ def _skippable_section_line(kind: str, line: str) -> bool:
         or re.fullmatch(r"[\s():]*", stripped)
     ):
         return True
-    if kind == "hotels" and (stripped.startswith(("-", "*", "•")) or stripped.startswith("**")):
-        return True
     return False
+
+
+def _collapse_blank_lines(text: str) -> str:
+    """A skip can leave the gap on both sides of a removed block."""
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def replace_named_section(answer: str, kind: str, new_section: str) -> str:
@@ -2836,6 +3135,7 @@ def replace_named_section(answer: str, kind: str, new_section: str) -> str:
     lines = (answer or "").splitlines()
     out: list[str] = []
     skipping = False
+    in_old_list = False
     inserted = False
     for line in lines:
         if _section_kind(line) == kind:
@@ -2843,14 +3143,31 @@ def replace_named_section(answer: str, kind: str, new_section: str) -> str:
                 out.extend(new_section.splitlines())
                 inserted = True
             skipping = True
+            in_old_list = kind in {"hotels", "flights"}
+            continue
+        if skipping and in_old_list:
+            other = _section_kind(line)
+            if other and other != kind:
+                in_old_list = False
+                skipping = False
+                out.append(line)
+                continue
+            if not line.strip():
+                in_old_list = False
+                skipping = False
+                out.append(line)
+                continue
+            if _old_list_line(line):
+                continue
+            out.append(line)
             continue
         if skipping and _skippable_section_line(kind, line):
             continue
         skipping = False
         out.append(line)
-    text = "\n".join(out).strip()
+    text = _collapse_blank_lines("\n".join(out))
     if not inserted:
-        text = (text + "\n\n" + new_section).strip()
+        text = _collapse_blank_lines(text + "\n\n" + new_section)
     return text
 
 
@@ -2899,42 +3216,174 @@ def _hotel_names(record: dict[str, Any]) -> list[str]:
     return names
 
 
-def _line_restates_hotel(line: str, names: list[str]) -> bool:
-    """A numbered or bulleted line that names a hotel already in the rendered block."""
+def _list_item_body(line: str) -> str | None:
+    match = re.match(r"^\s*(?:[-*•]|\d+[.)])\s+(.*)$", line)
+    if not match:
+        return None
+    return re.sub(r"[*_`]", "", match.group(1)).strip()
+
+
+def _booking_line_repeats_hotel(line: str, links: set[str]) -> bool:
+    """A 'Booking:' line whose only job is to repeat a URL already in the hotel block."""
+    if not links or not re.match(r"^\s*(?:[-*•]\s*)?(?:\*\*)?booking(?:\*\*)?\s*:", line, re.I):
+        return False
+    return any(link in line for link in links)
+
+
+_STRUCTURED_FIELD_BULLET = re.compile(
+    r"^\s*(?:[-*•]|\d+[.)])\s*(?:\*\*)?"
+    r"(?:nightly rate|price(?:\s*/\s*night)?|rating|booking|fare|outbound|return)"
+    r"(?:\*\*)?\s*:",
+    re.I,
+)
+_DAY_LINE = re.compile(r"\bday\s+\d+\b", re.I)
+_GROUND_LEG = re.compile(r"\b(?:train|metro|bus|tram|taxi|ferry)\b", re.I)
+_FLIGHT_DESIGNATOR = re.compile(r"\b[A-Z]{1,3}\d{2,4}\b")
+
+
+def _line_names_structured_hotel(line: str, names: list[str]) -> bool:
+    """A list or bold line that is a stored hotel name, not a sentence about it."""
     if not names:
         return False
-    folded = line.casefold()
-    if not any(name.casefold() in folded for name in names):
+    bold = re.fullmatch(r"\*\*(.+)\*\*", line.strip())
+    if bold:
+        text = bold.group(1).strip()
+    else:
+        text = _list_item_body(line)
+        if text is None:
+            return False
+    if _is_prose_sentence(text):
         return False
-    if re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+    folded = text.strip().rstrip(".,;!").casefold()
+    for name in names:
+        hotel = name.casefold()
+        if not hotel:
+            continue
+        if folded == hotel:
+            return True
+        if re.match(
+            rf"{re.escape(hotel)}(?![0-9a-z])\s*(?:[:|(]|[\u2014\u2013-])",
+            folded,
+        ):
+            return True
+    return False
+
+
+def _record_fare_tokens(record: dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for item in record.get("itineraries") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("price", "return_price"):
+            raw = item.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            token = str(raw).split()[0].lstrip("$€£")
+            if token:
+                tokens.add(token)
+    return tokens
+
+
+def _line_matches_structured_flight(line: str, numbers: set[str], fares: set[str]) -> bool:
+    """A list item or bold offer that repeats a stored flight, not prose that mentions it."""
+    if _labelled_alternate_flight(line) or _DAY_LINE.search(line) or _GROUND_LEG.search(line):
+        return False
+    plain = re.sub(r"[*_`]", "", line).strip()
+    prose_source = _list_item_body(line) or plain
+    if _is_prose_sentence(prose_source):
+        return False
+    is_bold = re.fullmatch(r"\*\*.+\*\*", line.strip()) is not None
+    is_numbered = re.match(r"\s*\d+[.)]\s+\S", line) is not None
+    # A bold or numbered offer heading that carries its own flight designator.
+    if _FLIGHT_DESIGNATOR.search(line) and (is_bold or is_numbered):
         return True
-    bare = re.sub(r"[*_`]", "", line).strip()
-    return any(bare.casefold() == name.casefold() for name in names)
+    if _list_item_body(line) is None and not is_bold:
+        return False
+    has_number = _line_mentions_flight_number(line, numbers)
+    has_kiwi = "kiwi.com" in line.lower()
+    has_price_or_link = bool(_FLIGHT_PRICE.search(line) or re.search(r"https?://", line))
+    if has_number and has_price_or_link:
+        return True
+    if (has_number or has_kiwi) and any(
+        fare and re.search(rf"\b{re.escape(fare)}\b", line) for fare in fares
+    ):
+        return True
+    return False
+
+
+def _drop_structured_repeats(lines: list[str], matches) -> list[str]:
+    """Drop structured repeats and the field bullets that sit directly under them."""
+    kept: list[str] = []
+    run = False
+    for line in lines:
+        if not line.strip():
+            run = False
+            kept.append(line)
+            continue
+        if matches(line):
+            run = True
+            continue
+        if run and _STRUCTURED_FIELD_BULLET.match(line):
+            continue
+        run = False
+        kept.append(line)
+    return kept
+
+
+def _line_restates_hotel(line: str, names: list[str]) -> bool:
+    """A list or bold line that repeats a hotel already in the rendered block."""
+    return _line_names_structured_hotel(line, names)
+
+
+def _under_named_heading(lines: list[str], kind: str) -> list[str]:
+    """Drop a real heading of ``kind`` and the list that sits directly under it."""
+    kept: list[str] = []
+    under = False
+    for line in lines:
+        if _is_section_heading(line):
+            under = _section_kind(line) == kind
+            if under:
+                continue
+            kept.append(line)
+            continue
+        if under:
+            if not line.strip() or _list_item_body(line) is not None:
+                continue
+            under = False
+        kept.append(line)
+    return kept
 
 
 def replace_hotel_section(answer: str, record: dict[str, Any]) -> str:
     section = render_hotel_section(record)
     text = replace_named_section(answer, "hotels", section)
     names = _hotel_names(record)
+    links = {
+        str(hotel.get("link"))
+        for hotel in record.get("hotels") or []
+        if isinstance(hotel, dict) and hotel.get("link")
+    }
 
     def keep(line: str) -> bool:
         if _label_only_line(line):
             return False
-        if _section_kind(line) == "hotels":
-            return False
         if _line_restates_hotel(line, names):
+            return False
+        if _booking_line_repeats_hotel(line, links):
             return False
         return True
 
     parts = _split_around(text, section)
     if parts is None:
-        kept = [line for line in text.splitlines() if keep(line) or line in section.splitlines()]
-        return "\n".join(kept).strip()
+        outside = [line for line in text.splitlines() if line not in section.splitlines()]
+        kept = [line for line in _under_named_heading(outside, "hotels") if keep(line)]
+        return "\n".join([*kept, *section.splitlines()]).strip()
     before, after = parts
-    lines = [line for line in before if keep(line)]
+    after = _drop_structured_repeats(after, lambda line: _line_names_structured_hotel(line, names))
+    lines = [line for line in _under_named_heading(before, "hotels") if keep(line)]
     lines.extend(section.splitlines())
-    lines.extend(line for line in after if keep(line))
-    return "\n".join(lines).strip()
+    lines.extend(line for line in _under_named_heading(after, "hotels") if keep(line))
+    return _collapse_blank_lines("\n".join(lines))
 
 
 def separate_alternate_flights(answer: str, flight_text: str) -> str:
@@ -3206,6 +3655,40 @@ def _drop_named_lines(answer: str, names: set[str]) -> str:
     return "\n".join(kept).strip()
 
 
+def _labelled_alternate_flight(line: str) -> bool:
+    """A coordinator alternate for other dates, which the prompt allows beside the search."""
+    return bool(re.search(r"\balternate\b", line, re.I) and re.search(r"different dates", line, re.I))
+
+
+def _stale_flight_offer_line(line: str) -> bool:
+    """A leftover fare under an empty Flights heading: a Kiwi link, or a number beside a price."""
+    if _labelled_alternate_flight(line) or _DAY_LINE.search(line) or _GROUND_LEG.search(line):
+        return False
+    if re.search(r"kiwi\.com", line, re.I):
+        return True
+    return bool(_FLIGHT_PRICE.search(line) and re.search(r"\b[A-Z]{1,3}\d{2,4}\b", line))
+
+
+def _replace_empty_flight_section(answer: str) -> str:
+    """Say that nothing was found, and drop the priced lines that sat under the old heading."""
+    text = replace_named_section(answer, "flights", NO_FLIGHTS_FOUND)
+    if NO_FLIGHTS_FOUND not in text:
+        text = (text.rstrip() + "\n\n" + NO_FLIGHTS_FOUND).strip()
+    kept: list[str] = []
+    under = False
+    for line in text.splitlines():
+        if line.strip() == NO_FLIGHTS_FOUND:
+            under = True
+            kept.append(line)
+            continue
+        if under and _is_section_heading(line) and _section_kind(line) != "flights":
+            under = False
+        if under and _stale_flight_offer_line(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
     """Drop ungrounded venues, unconfirmed hours, mixed flight fields, and lost hotels."""
     restaurants = _tool_blob(messages, "suggest_restaurants")
@@ -3249,6 +3732,8 @@ def apply_coordinator_checks(answer: str, messages: list[Any]) -> str:
     flight_record = active_flight_record(messages)
     if flight_record and flight_record.get("itineraries"):
         answer = replace_flight_section(answer, flight_record)
+    elif _searches_found_no_flights(messages):
+        answer = _replace_empty_flight_section(answer)
     else:
         answer = repair_flight_pairing(answer, flights)
         answer = separate_alternate_flights(answer, flights)
@@ -3309,7 +3794,12 @@ def attach_hotel_capture(tool: BaseTool) -> BaseTool:
     async def wrapped(**kwargs: Any) -> Any:
         value = await original(**kwargs)
         content, artifact = value if isinstance(value, tuple) and len(value) == 2 else (value, None)
-        return _seal_tool_text(tool, content, artifact, seal_hotel_tool_result(content, kwargs))
+        return _seal_tool_text(
+            tool,
+            content,
+            artifact,
+            seal_hotel_tool_result(content, kwargs, tool_name=tool.name),
+        )
 
     tool.coroutine = wrapped
     setattr(tool, "_trip_hotel_capture", True)
